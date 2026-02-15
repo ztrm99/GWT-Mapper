@@ -1,0 +1,28 @@
+plugins {
+    id("java")
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    compileOnly("net.portswigger.burp.extensions:montoya-api:2025.10")
+    testImplementation("org.junit.jupiter:junit-jupiter:5.11.4")
+}
+
+tasks.withType<JavaCompile> {
+    sourceCompatibility = "17"
+    targetCompatibility = "17"
+    options.encoding = "UTF-8"
+}
+
+tasks.jar {
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    from(configurations.runtimeClasspath.get().filter { it.isDirectory })
+    from(configurations.runtimeClasspath.get().filterNot { it.isDirectory }.map { zipTree(it) })
+}
+
+tasks.test {
+    useJUnitPlatform()
+}
