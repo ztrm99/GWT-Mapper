@@ -1,44 +1,92 @@
-# Repository Guidelines
+# Repository Guidelines (Canonical)
 
-## Project Structure & Module Organization
-- Core extension code is in `src/main/java`.
-- Unit tests are in `src/test/java` (JUnit 5).
-- Gradle wrapper and build config live at `gradlew`, `build.gradle.kts`, and `settings.gradle.kts`.
-- Reference tooling/scripts are in `reference/`.
-- `extension-template-project/` is a separate template project; do not mix production changes into it unless intentionally updating the template.
-- Build artifacts are generated under `build/` (for example `build/libs/gwt-rpc-mapper.jar`) and should not be edited manually.
+This is the source-of-truth repository guidance for humans and coding agents. Keep `CLAUDE.md` brief and point back here.
 
-## Build, Test, and Development Commands
-- `./gradlew clean` removes generated outputs.
-- `./gradlew build` compiles, runs tests, and produces the extension JAR.
-- `./gradlew test` runs unit tests only.
-- `./gradlew test --tests GwtDetectorTest` runs a single test class while iterating.
+## Project Overview
 
-Use `gradlew.bat` instead of `./gradlew` on Windows.
+GWT-RPC Mapper is a Burp Suite extension (Montoya API) for detecting and analyzing Google Web Toolkit (GWT) RPC traffic. It detects GWT artifacts (`.cache.js`, `.nocache.js`, `.gwt.rpc`), parses pipe-delimited RPC payloads, extracts likely service/method names, and exposes a Swing UI in Burp.
 
-## Coding Style & Naming Conventions
-- Language level is Java 17; keep code compatible with the toolchain in `build.gradle.kts`.
-- Use 4-space indentation and UTF-8 encoding.
-- Class names: `PascalCase` (for example `GwtDownloader`); methods/fields: `camelCase`; constants: `UPPER_SNAKE_CASE`.
-- Keep methods focused and side effects explicit, especially in Burp handler callbacks.
-- Prefer small, testable utility methods for parsing/detection logic.
+## Project Structure
 
-## Testing Guidelines
+- Core extension code: `src/main/java`
+- Unit tests (JUnit 5): `src/test/java`
+- Build config: `build.gradle.kts`, `settings.gradle.kts`, `gradlew`, `gradlew.bat`
+- Reference scripts/prototypes: `reference/`
+- Build artifacts: `build/` (for example `build/libs/gwt-rpc-mapper.jar`) should not be edited manually
+
+Note: Source currently uses the Java default package (no `package ...;` declarations). Keep it consistent unless intentionally migrating to packages.
+
+## Build, Test, Run
+
+Windows (PowerShell):
+- `.\gradlew.bat clean`
+- `.\gradlew.bat build`
+- `.\gradlew.bat test`
+- `.\gradlew.bat test --tests GwtDetectorTest`
+
+macOS/Linux:
+- `./gradlew clean`
+- `./gradlew build`
+- `./gradlew test`
+- `./gradlew test --tests GwtDetectorTest`
+
+JAR output:
+- `build/libs/gwt-rpc-mapper.jar`
+
+## Load In Burp
+
+1. Build the jar (`build/libs/gwt-rpc-mapper.jar`).
+2. In Burp: `Extensions` -> `Installed` -> `Add` -> select the jar.
+3. If Burp asks for a Java version/runtime: this project targets Java 17 (see `build.gradle.kts`).
+
+## Architecture (Current Files)
+
+All production sources are in `src/main/java` (default package).
+
+| File | Role |
+|------|------|
+| `Extension.java` | Main entry point. Owns UI wiring, Burp callbacks, passive scan integration, analysis orchestration, and export. |
+| `GwtDetector.java` | Stateless detection utilities (artifact URL patterns, RPC request signatures/headers, artifact path extraction). |
+| `GwtRpcParser.java` | Pipe-delimited GWT-RPC tokenization and table-like parsing (request/response) for analyst readability. |
+| `MethodExtractor.java` | Heuristics for extracting likely interfaces/method names from compiled artifacts (gwtmap-style strategies). |
+| `ArtifactStore.java` | Thread-safe in-memory store for discovered artifacts and associated HTTP context. |
+| `GwtArtifact.java` | Artifact model/record (host/path/type/resolution + source context + timestamp). |
+| `GwtDownloader.java` | Artifact downloading, reusing auth/session headers from the source request when available. |
+
+## Burp + Swing Rules (Non-Negotiable)
+
+- Do not block Burp threads. Anything non-trivial (downloads, parsing, history analysis) must run off-thread.
+- UI updates must be performed on the Swing EDT (use `SwingUtilities.invokeLater` / `invokeAndWait` as appropriate).
+- Keep handler callbacks (passive scan, HTTP handlers, editor providers) small and explicit about side effects.
+- Prefer small, testable pure helpers for detection/parsing/extraction logic.
+
+## Coding Style
+
+- Java 17, 4-space indentation, UTF-8 (match `build.gradle.kts`).
+- Names: `PascalCase` classes, `camelCase` methods/fields, `UPPER_SNAKE_CASE` constants.
+- Keep methods focused; avoid hidden global state in Burp callbacks.
+
+## Testing Contract
+
 - Framework: JUnit Jupiter (`org.junit.jupiter`).
-- Name test classes `*Test.java` and test methods with behavior-focused names (for example `parseResponseParsesOkPayload`).
-- Add/adjust tests for parser and detector changes before merging.
-- Run `./gradlew test` before opening a PR.
+- Tests live in `src/test/java` and are named `*Test.java`.
+- If you change:
+  - detector regexes/signatures: add tests in `GwtDetectorTest`
+  - RPC parsing logic: add tests in `GwtRpcParserTest`
+  - method extraction heuristics: add tests in `MethodExtractorTest`
+- Prefer synthetic fixtures. Do not add real customer traffic or live tokens to tests.
 
-## Commit & Pull Request Guidelines
-- No Git history is available in this workspace snapshot, so no enforced historical convention can be inferred.
-- Recommended commit format: imperative, scoped subject (for example `parser: handle empty RPC payload`).
+## Commits & PRs
+
+- Recommended commit subject: imperative, scoped (example: `parser: handle empty RPC payload`).
 - Keep commits focused; avoid mixing refactors with behavior changes.
 - PRs should include:
-  - What changed and why.
-  - Validation steps/commands run.
-  - Screenshots or short notes for UI changes in the Burp tab.
-  - Linked issue/ticket when applicable.
+  - what changed and why
+  - validation commands run (for example `.\gradlew.bat test`)
+  - screenshots/notes for Burp UI changes
 
-## Security & Configuration Tips
-- Do not commit captured traffic, session tokens, or local Burp artifacts.
-- Use test-safe sample payloads in fixtures and docs.
+## Security & Redaction
+
+- Do not commit captured traffic, session tokens, cookies, auth headers, or local Burp state.
+- Keep fixtures and docs test-safe: synthetic hosts, synthetic payloads, redacted headers.
+- Assume anything under version control will be shared publicly at some point.
