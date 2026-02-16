@@ -18,6 +18,26 @@ class GwtRpcParserTest {
     }
 
     @Test
+    void parseRequestReturnsEmptyForNull() {
+        assertTrue(GwtRpcParser.parseRequest(null).isEmpty());
+    }
+
+    @Test
+    void parseRequestReturnsEmptyForEmptyString() {
+        assertTrue(GwtRpcParser.parseRequest("").isEmpty());
+    }
+
+    @Test
+    void parseResponseReturnsEmptyForNull() {
+        assertTrue(GwtRpcParser.parseResponse(null).isEmpty());
+    }
+
+    @Test
+    void parseResponseReturnsEmptyForEmptyString() {
+        assertTrue(GwtRpcParser.parseResponse("").isEmpty());
+    }
+
+    @Test
     void parseResponseParsesOkPayload() {
         String body = "//OK[\"done\",123,[\"a\",\"b\"]]";
         List<GwtRpcParser.RpcRow> rows = GwtRpcParser.parseResponse(body);

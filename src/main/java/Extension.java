@@ -63,13 +63,13 @@ import java.util.Collections;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
-import java.util.HashSet;
 import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.regex.Pattern;
-import java.util.regex.Matcher;
 
 import static burp.api.montoya.core.Range.range;
 import static burp.api.montoya.http.message.HttpRequestResponse.httpRequestResponse;
@@ -91,32 +91,16 @@ public class Extension implements BurpExtension, HttpHandler, PassiveScanCheck, 
     private ArtifactStore artifactStore;
     private GwtDownloader downloader;
     private ExecutorService passiveExecutor;
+    private ExecutorService historyExecutor;
+    private volatile Future<?> historyFuture;
 
     private JPanel mainPanel;
-    private DefaultTableModel artifactsModel;
-    private JTable artifactsTable;
-    private TableRowSorter<DefaultTableModel> rowSorter;
+    private DashboardPanel dashboard;
     private DefaultTableModel methodsCatalogModel;
     private JTable methodsCatalogTable;
-    private final Set<String> methodsCatalogSet = new HashSet<>();
-    private final Set<String> expandedNoCacheUrls = new HashSet<>();
-    private JTextField outputFolderField;
-    private JTextField passiveMaxBodyBytesField;
-    private JTextField filterField;
-    private JCheckBox passiveScanCheckBox;
-    private JCheckBox scopeOnlyHistoryCheckBox;
-    private JCheckBox fastAnalyzeCheckBox;
-    private JButton cancelHistoryButton;
-    private JLabel historyProgressLabel;
+    private final Set<String> methodsCatalogSet = ConcurrentHashMap.newKeySet();
+    private final Set<String> expandedNoCacheUrls = ConcurrentHashMap.newKeySet();
     private final AtomicBoolean cancelHistoryFlag = new AtomicBoolean(false);
-    private HttpRequestEditor requestPreviewEditor;
-    private HttpResponseEditor responsePreviewEditor;
-    private JTextArea analysisSummaryArea;
-    private DefaultTableModel methodsTableModel;
-    private JTable methodsTable;
-    private JTextArea analysisHeadersArea;
-    private JTextArea analysisRunsArea;
-    private JTabbedPane analysisTabs;
     private JTabbedPane workTabs;
     private int analysisRunCounter = 0;
     private int passiveMaxBodyBytes;
@@ -132,6 +116,11 @@ public class Extension implements BurpExtension, HttpHandler, PassiveScanCheck, 
         this.downloader = new GwtDownloader(montoyaApi);
         this.passiveExecutor = Executors.newSingleThreadExecutor(r -> {
             Thread t = new Thread(r, "gwt-passive-worker");
+            t.setDaemon(true);
+            return t;
+        });
+        this.historyExecutor = Executors.newSingleThreadExecutor(r -> {
+            Thread t = new Thread(r, "gwt-history-analysis");
             t.setDaemon(true);
             return t;
         });
@@ -319,142 +308,8 @@ public class Extension implements BurpExtension, HttpHandler, PassiveScanCheck, 
     private void initUi() {
         mainPanel = new JPanel(new BorderLayout());
         mainPanel.setBorder(BorderFactory.createEmptyBorder(8, 8, 8, 8));
-        JPanel dashboardPanel = new JPanel(new BorderLayout());
 
-        JPanel top = new JPanel(new GridLayout(3, 1, 6, 6));
-        JPanel row1 = new JPanel(new FlowLayout(FlowLayout.LEFT));
-        JPanel row2 = new JPanel(new FlowLayout(FlowLayout.LEFT));
-        JPanel row3 = new JPanel(new FlowLayout(FlowLayout.LEFT));
-
-        outputFolderField = new JTextField(loadOutputDirectory(), 45);
-        passiveMaxBodyBytesField = new JTextField(String.valueOf(passiveMaxBodyBytes), 8);
-
-        JButton browseButton = new JButton("Browse...");
-        browseButton.addActionListener(e -> chooseFolder());
-
-        JButton saveSettingsButton = new JButton("Save Settings");
-        saveSettingsButton.addActionListener(e -> persistSettings());
-
-        passiveScanCheckBox = new JCheckBox("Enable Passive Scan", loadPassiveScanEnabled());
-        passiveScanCheckBox.addActionListener(e -> persistSettings());
-
-        JButton downloadSelectedButton = new JButton("Download Selected");
-        downloadSelectedButton.addActionListener(e -> downloadSelected());
-
-        JButton downloadAllButton = new JButton("Download All");
-        downloadAllButton.addActionListener(e -> downloadAll());
-
-        JButton tempFolderButton = new JButton("Use Temporary Folder");
-        tempFolderButton.addActionListener(e -> useTempFolder());
-
-        JButton clearButton = new JButton("Clear Artifacts");
-        clearButton.addActionListener(e -> clearArtifacts());
-
-        JButton exportCsvButton = new JButton("Export CSV");
-        exportCsvButton.addActionListener(e -> exportCsv());
-        JButton exportMethodsButton = new JButton("Export Methods");
-        exportMethodsButton.addActionListener(e -> exportMethodsCsv());
-        JButton analyzeSelectedButton = new JButton("Analyze Selected Item(s)");
-        analyzeSelectedButton.addActionListener(e -> analyzeSelectedArtifacts());
-        JButton analyzeHistoryButton = new JButton("Analyze HTTP History");
-        analyzeHistoryButton.addActionListener(e -> analyzeHttpHistory());
-        cancelHistoryButton = new JButton("Cancel History Analysis");
-        cancelHistoryButton.setEnabled(false);
-        cancelHistoryButton.addActionListener(e -> cancelHistoryFlag.set(true));
-
-        filterField = new JTextField(28);
-        JButton applyFilterButton = new JButton("Apply Filter");
-        applyFilterButton.addActionListener(e -> applyFilter());
-        scopeOnlyHistoryCheckBox = new JCheckBox("Scope-Only History", loadScopeOnlyHistory());
-        scopeOnlyHistoryCheckBox.addActionListener(e -> persistSettings());
-        fastAnalyzeCheckBox = new JCheckBox("Fast Analyze (skip cache fetch)", loadFastAnalyze());
-        fastAnalyzeCheckBox.addActionListener(e -> persistSettings());
-        historyProgressLabel = new JLabel("Idle");
-
-        row1.add(new JLabel("Download Folder:"));
-        row1.add(outputFolderField);
-        row1.add(browseButton);
-        row1.add(saveSettingsButton);
-        row1.add(passiveScanCheckBox);
-        row1.add(new JLabel("Passive Max Body (bytes):"));
-        row1.add(passiveMaxBodyBytesField);
-
-        row2.add(downloadSelectedButton);
-        row2.add(downloadAllButton);
-        row2.add(tempFolderButton);
-        row2.add(clearButton);
-        row2.add(exportCsvButton);
-        row2.add(exportMethodsButton);
-        row2.add(analyzeSelectedButton);
-        row2.add(analyzeHistoryButton);
-
-        row3.add(new JLabel("Filter:"));
-        row3.add(filterField);
-        row3.add(applyFilterButton);
-        row3.add(scopeOnlyHistoryCheckBox);
-        row3.add(fastAnalyzeCheckBox);
-        row3.add(cancelHistoryButton);
-        row3.add(historyProgressLabel);
-
-        top.add(row1);
-        top.add(row2);
-        top.add(row3);
-
-        artifactsModel = new DefaultTableModel(new Object[]{
-                "Host", "Artifact Path", "Type", "Resolved URL", "Source", "Discovered At"
-        }, 0) {
-            @Override
-            public boolean isCellEditable(int row, int column) {
-                return false;
-            }
-        };
-
-        artifactsTable = new JTable(artifactsModel);
-        rowSorter = new TableRowSorter<>(artifactsModel);
-        artifactsTable.setRowSorter(rowSorter);
-        artifactsTable.getSelectionModel().addListSelectionListener(e -> {
-            if (!e.getValueIsAdjusting()) {
-                updateSelectedPreview();
-            }
-        });
-
-        requestPreviewEditor = api.userInterface().createHttpRequestEditor(EditorOptions.READ_ONLY);
-        responsePreviewEditor = api.userInterface().createHttpResponseEditor(EditorOptions.READ_ONLY);
-        analysisSummaryArea = createReadOnlyTextArea();
-        analysisHeadersArea = createReadOnlyTextArea();
-        analysisRunsArea = createReadOnlyTextArea();
-        methodsTableModel = new DefaultTableModel(new Object[]{"Method"}, 0) {
-            @Override
-            public boolean isCellEditable(int row, int column) {
-                return false;
-            }
-        };
-        methodsTable = new JTable(methodsTableModel);
-        methodsTable.setRowSorter(new TableRowSorter<>(methodsTableModel));
-        analysisTabs = new JTabbedPane();
-        analysisTabs.addTab("Summary", new JScrollPane(analysisSummaryArea));
-        analysisTabs.addTab("Methods", new JScrollPane(methodsTable));
-        analysisTabs.addTab("Headers", new JScrollPane(analysisHeadersArea));
-        analysisTabs.addTab("Runs", new JScrollPane(analysisRunsArea));
-        requestPreviewEditor.setRequest(placeholderRequest("Select an artifact row to preview request."));
-        responsePreviewEditor.setResponse(placeholderResponse("Select an artifact row to preview response."));
-        setAnalysisText(
-                "Click 'Analyze Selected Item(s)' to extract GWT methods/version/headers.",
-                Collections.emptyList(),
-                "",
-                "Initial State"
-        );
-
-        JPanel previews = new JPanel(new GridLayout(1, 3, 6, 6));
-        previews.add(wrapTitled("Request Preview", requestPreviewEditor.uiComponent()));
-        previews.add(wrapTitled("Response Preview", responsePreviewEditor.uiComponent()));
-        previews.add(wrapTitled("Analysis", analysisTabs));
-
-        JSplitPane split = new JSplitPane(JSplitPane.VERTICAL_SPLIT, new JScrollPane(artifactsTable), previews);
-        split.setResizeWeight(0.60);
-
-        dashboardPanel.add(top, BorderLayout.NORTH);
-        dashboardPanel.add(split, BorderLayout.CENTER);
+        dashboard = new DashboardPanel();
 
         JPanel scannerPanel = new JPanel(new BorderLayout());
         methodsCatalogModel = new DefaultTableModel(new Object[]{"Method", "Source", "First Seen"}, 0) {
@@ -473,7 +328,7 @@ public class Extension implements BurpExtension, HttpHandler, PassiveScanCheck, 
         scannerPanel.add(scannerControls, BorderLayout.SOUTH);
 
         workTabs = new JTabbedPane();
-        workTabs.addTab("Dashboard", dashboardPanel);
+        workTabs.addTab("Dashboard", dashboard);
         workTabs.addTab("Scanner", scannerPanel);
 
         mainPanel.add(workTabs, BorderLayout.CENTER);
@@ -483,24 +338,24 @@ public class Extension implements BurpExtension, HttpHandler, PassiveScanCheck, 
         JFileChooser chooser = new JFileChooser();
         chooser.setFileSelectionMode(JFileChooser.DIRECTORIES_ONLY);
         if (chooser.showOpenDialog(mainPanel) == JFileChooser.APPROVE_OPTION) {
-            outputFolderField.setText(chooser.getSelectedFile().toPath().toString());
+            dashboard.outputFolderField.setText(chooser.getSelectedFile().toPath().toString());
             persistSettings();
         }
     }
 
     private void persistSettings() {
-        String outputDir = safe(outputFolderField.getText()).trim();
+        String outputDir = safe(dashboard.outputFolderField.getText()).trim();
         if (outputDir.isEmpty()) {
             outputDir = defaultOutputDir.toString();
-            outputFolderField.setText(outputDir);
+            dashboard.outputFolderField.setText(outputDir);
         }
-        int parsedPassiveMax = parsePositiveInt(safe(passiveMaxBodyBytesField.getText()), DEFAULT_PASSIVE_MAX_BODY_BYTES);
+        int parsedPassiveMax = parsePositiveInt(safe(dashboard.passiveMaxBodyBytesField.getText()), DEFAULT_PASSIVE_MAX_BODY_BYTES);
         passiveMaxBodyBytes = parsedPassiveMax;
-        passiveMaxBodyBytesField.setText(String.valueOf(passiveMaxBodyBytes));
+        dashboard.passiveMaxBodyBytesField.setText(String.valueOf(passiveMaxBodyBytes));
         extensionData.setString(SETTING_OUTPUT_DIR, outputDir);
-        extensionData.setBoolean(SETTING_PASSIVE_SCAN_ENABLED, passiveScanCheckBox.isSelected());
-        extensionData.setBoolean(SETTING_SCOPE_ONLY_HISTORY, scopeOnlyHistoryCheckBox.isSelected());
-        extensionData.setBoolean(SETTING_FAST_ANALYZE, fastAnalyzeCheckBox.isSelected());
+        extensionData.setBoolean(SETTING_PASSIVE_SCAN_ENABLED, dashboard.passiveScanCheckBox.isSelected());
+        extensionData.setBoolean(SETTING_SCOPE_ONLY_HISTORY, dashboard.scopeOnlyHistoryCheckBox.isSelected());
+        extensionData.setBoolean(SETTING_FAST_ANALYZE, dashboard.fastAnalyzeCheckBox.isSelected());
         extensionData.setInteger(SETTING_PASSIVE_MAX_BODY_BYTES, passiveMaxBodyBytes);
         info("Settings saved.");
     }
@@ -537,23 +392,23 @@ public class Extension implements BurpExtension, HttpHandler, PassiveScanCheck, 
     }
 
     private boolean isPassiveScanEnabled() {
-        return passiveScanCheckBox == null || passiveScanCheckBox.isSelected();
+        return dashboard == null || dashboard.passiveScanCheckBox.isSelected();
     }
 
     private void applyFilter() {
-        String filter = safe(filterField.getText()).trim();
+        String filter = safe(dashboard.filterField.getText()).trim();
         if (filter.isEmpty()) {
-            rowSorter.setRowFilter(null);
+            dashboard.rowSorter.setRowFilter(null);
             return;
         }
-        rowSorter.setRowFilter(RowFilter.regexFilter("(?i)" + Pattern.quote(filter)));
+        dashboard.rowSorter.setRowFilter(RowFilter.regexFilter("(?i)" + Pattern.quote(filter)));
     }
 
     private void clearArtifacts() {
         artifactStore.clear();
-        artifactsModel.setRowCount(0);
-        requestPreviewEditor.setRequest(placeholderRequest("Select an artifact row to preview request."));
-        responsePreviewEditor.setResponse(placeholderResponse("Select an artifact row to preview response."));
+        dashboard.artifactsModel.setRowCount(0);
+        dashboard.requestPreviewEditor.setRequest(placeholderRequest("Select an artifact row to preview request."));
+        dashboard.responsePreviewEditor.setResponse(placeholderResponse("Select an artifact row to preview response."));
         setAnalysisText(
                 "Click 'Analyze Selected Item(s)' to extract GWT methods/version/headers.",
                 Collections.emptyList(),
@@ -629,7 +484,7 @@ public class Extension implements BurpExtension, HttpHandler, PassiveScanCheck, 
     private void useTempFolder() {
         try {
             Path tempOutputDir = Files.createTempDirectory("gwt-scanner-");
-            outputFolderField.setText(tempOutputDir.toString());
+            dashboard.outputFolderField.setText(tempOutputDir.toString());
             persistSettings();
             info("Using temporary folder: " + tempOutputDir);
         } catch (Exception ex) {
@@ -638,17 +493,17 @@ public class Extension implements BurpExtension, HttpHandler, PassiveScanCheck, 
     }
 
     private void downloadSelected() {
-        int[] rows = artifactsTable.getSelectedRows();
+        int[] rows = dashboard.artifactsTable.getSelectedRows();
         if (rows.length == 0) {
             JOptionPane.showMessageDialog(mainPanel, "Select at least one artifact row.");
             return;
         }
 
         for (int selectedRow : rows) {
-            int row = artifactsTable.convertRowIndexToModel(selectedRow);
-            String host = String.valueOf(artifactsModel.getValueAt(row, 0));
-            String path = String.valueOf(artifactsModel.getValueAt(row, 1));
-            String type = String.valueOf(artifactsModel.getValueAt(row, 2));
+            int row = dashboard.artifactsTable.convertRowIndexToModel(selectedRow);
+            String host = String.valueOf(dashboard.artifactsModel.getValueAt(row, 0));
+            String path = String.valueOf(dashboard.artifactsModel.getValueAt(row, 1));
+            String type = String.valueOf(dashboard.artifactsModel.getValueAt(row, 2));
             GwtArtifact artifact = artifactStore.find(host, path, type);
             if (artifact != null) {
                 downloader.downloadArtifact(artifact, resolveOutputRoot(), this::info, msg -> api.logging().logToError("[GWT Mapper] " + msg));
@@ -663,7 +518,7 @@ public class Extension implements BurpExtension, HttpHandler, PassiveScanCheck, 
     }
 
     private Path resolveOutputRoot() {
-        String configured = safe(outputFolderField.getText()).trim();
+        String configured = safe(dashboard.outputFolderField.getText()).trim();
         if (!configured.isEmpty()) {
             return Paths.get(configured);
         }
@@ -688,7 +543,7 @@ public class Extension implements BurpExtension, HttpHandler, PassiveScanCheck, 
             return false;
         }
 
-        SwingUtilities.invokeLater(() -> artifactsModel.addRow(new Object[]{
+        SwingUtilities.invokeLater(() -> dashboard.artifactsModel.addRow(new Object[]{
                 artifact.host,
                 artifact.path,
                 artifact.type,
@@ -713,7 +568,7 @@ public class Extension implements BurpExtension, HttpHandler, PassiveScanCheck, 
             }
             if (artifact.path.toLowerCase().endsWith(".cache.js") && artifact.sourceMessage != null && artifact.sourceMessage.hasResponse()) {
                 String body = safe(artifact.sourceMessage.response().bodyToString());
-                found.addAll(extractCacheMethodsLikeGwtMap(body));
+                found.addAll(MethodExtractor.extractCacheMethodsLikeGwtMap(body));
             }
             if (!found.isEmpty()) {
                 String sourceUrl = safe(artifact.resolvedUrl);
@@ -722,7 +577,8 @@ public class Extension implements BurpExtension, HttpHandler, PassiveScanCheck, 
                 }
                 addMethodsToCatalog(found, sourceUrl);
             }
-        } catch (Exception ignored) {
+        } catch (Exception ex) {
+            api.logging().logToError("[GWT Mapper] Method catalog enrichment failed: " + ex.getMessage());
         }
     }
 
@@ -735,10 +591,8 @@ public class Extension implements BurpExtension, HttpHandler, PassiveScanCheck, 
         if (url.isEmpty()) {
             return;
         }
-        synchronized (expandedNoCacheUrls) {
-            if (!expandedNoCacheUrls.add(url)) {
-                return;
-            }
+        if (!expandedNoCacheUrls.add(url)) {
+            return;
         }
         passiveExecutor.submit(() -> expandNoCacheToPermutations(url, artifact.sourceRequest));
     }
@@ -754,7 +608,7 @@ public class Extension implements BurpExtension, HttpHandler, PassiveScanCheck, 
                 return;
             }
             String body = safe(rr.response().bodyToString());
-            Set<String> permutations = extractPermutationsFromNoCache(body);
+            Set<String> permutations = MethodExtractor.extractPermutationsFromNoCache(body);
             String moduleBase = noCacheUrl.substring(0, Math.max(0, noCacheUrl.lastIndexOf('/') + 1));
             for (String perm : permutations) {
                 String cacheUrl = moduleBase + perm + ".cache.js";
@@ -768,32 +622,9 @@ public class Extension implements BurpExtension, HttpHandler, PassiveScanCheck, 
                         rr
                 );
             }
-        } catch (Exception ignored) {
+        } catch (Exception ex) {
+            api.logging().logToError("[GWT Mapper] NoCache expansion failed for " + noCacheUrl + ": " + ex.getMessage());
         }
-    }
-
-    private Set<String> extractPermutationsFromNoCache(String code) {
-        Set<String> permutations = new LinkedHashSet<>();
-        String source = safe(code);
-        // gwtmap clean-mode style: unflattenKeylistIntoAnswers(...,'<32hex>')
-        Matcher clean = Pattern.compile("unflattenKeylistIntoAnswers\\([^\\n]*'([A-Z0-9]{32})'\\)").matcher(source);
-        while (clean.find()) {
-            permutations.add(clean.group(1));
-            if (permutations.size() >= 20) {
-                return permutations;
-            }
-        }
-        // gwtmap obfuscated style: selectingPermutation marker and embedded IDs
-        if (source.contains("selectingPermutation")) {
-            Matcher obf = Pattern.compile("([A-Z0-9]{32})").matcher(source);
-            while (obf.find()) {
-                permutations.add(obf.group(1));
-                if (permutations.size() >= 20) {
-                    break;
-                }
-            }
-        }
-        return permutations;
     }
 
     private HttpRequest reuseAuthHeaders(HttpRequest request, HttpRequest sourceRequest) {
@@ -804,7 +635,8 @@ public class Extension implements BurpExtension, HttpHandler, PassiveScanCheck, 
                     request = request.withAddedHeader(header.name(), safe(header.value()));
                 }
             }
-        } catch (Exception ignored) {
+        } catch (Exception ex) {
+            api.logging().logToError("[GWT Mapper] Auth header reuse failed: " + ex.getMessage());
         }
         return request;
     }
@@ -849,31 +681,16 @@ public class Extension implements BurpExtension, HttpHandler, PassiveScanCheck, 
                 .replace(">", "&gt;");
     }
 
-    private JTextArea createReadOnlyTextArea() {
-        JTextArea area = new JTextArea();
-        area.setEditable(false);
-        area.setLineWrap(true);
-        area.setWrapStyleWord(true);
-        return area;
-    }
-
-    private JPanel wrapTitled(String title, Component component) {
-        JPanel panel = new JPanel(new BorderLayout());
-        panel.setBorder(BorderFactory.createTitledBorder(title));
-        panel.add(component, BorderLayout.CENTER);
-        return panel;
-    }
-
     private void setAnalysisText(String summary, List<String> methods, String headers, String runLabel) {
-        analysisSummaryArea.setText(safe(summary));
-        analysisHeadersArea.setText(safe(headers));
-        methodsTableModel.setRowCount(0);
+        dashboard.analysisSummaryArea.setText(safe(summary));
+        dashboard.analysisHeadersArea.setText(safe(headers));
+        dashboard.methodsTableModel.setRowCount(0);
         for (String method : methods) {
-            methodsTableModel.addRow(new Object[]{method});
+            dashboard.methodsTableModel.addRow(new Object[]{method});
         }
-        analysisSummaryArea.setCaretPosition(0);
-        analysisHeadersArea.setCaretPosition(0);
-        analysisRunsArea.insert(
+        dashboard.analysisSummaryArea.setCaretPosition(0);
+        dashboard.analysisHeadersArea.setCaretPosition(0);
+        dashboard.analysisRunsArea.insert(
                 "=== " + runLabel + " ===\n" +
                         safe(summary) + "\n" +
                         (methods.isEmpty() ? "" : ("Methods: " + String.join(", ", methods) + "\n")) +
@@ -901,35 +718,35 @@ public class Extension implements BurpExtension, HttpHandler, PassiveScanCheck, 
     private void updateSelectedPreview() {
         GwtArtifact artifact = selectedArtifact();
         if (artifact == null) {
-            requestPreviewEditor.setRequest(placeholderRequest("Select an artifact row to preview request."));
-            responsePreviewEditor.setResponse(placeholderResponse("Select an artifact row to preview response."));
+            dashboard.requestPreviewEditor.setRequest(placeholderRequest("Select an artifact row to preview request."));
+            dashboard.responsePreviewEditor.setResponse(placeholderResponse("Select an artifact row to preview response."));
             return;
         }
 
-        requestPreviewEditor.setRequest(buildPreviewRequest(artifact));
-        responsePreviewEditor.setResponse(buildPreviewResponse(artifact));
+        dashboard.requestPreviewEditor.setRequest(buildPreviewRequest(artifact));
+        dashboard.responsePreviewEditor.setResponse(buildPreviewResponse(artifact));
     }
 
     private GwtArtifact selectedArtifact() {
-        int selectedRow = artifactsTable.getSelectedRow();
+        int selectedRow = dashboard.artifactsTable.getSelectedRow();
         if (selectedRow < 0) {
             return null;
         }
-        int row = artifactsTable.convertRowIndexToModel(selectedRow);
-        String host = String.valueOf(artifactsModel.getValueAt(row, 0));
-        String path = String.valueOf(artifactsModel.getValueAt(row, 1));
-        String type = String.valueOf(artifactsModel.getValueAt(row, 2));
+        int row = dashboard.artifactsTable.convertRowIndexToModel(selectedRow);
+        String host = String.valueOf(dashboard.artifactsModel.getValueAt(row, 0));
+        String path = String.valueOf(dashboard.artifactsModel.getValueAt(row, 1));
+        String type = String.valueOf(dashboard.artifactsModel.getValueAt(row, 2));
         return artifactStore.find(host, path, type);
     }
 
     private List<GwtArtifact> selectedArtifacts() {
-        int[] selectedRows = artifactsTable.getSelectedRows();
+        int[] selectedRows = dashboard.artifactsTable.getSelectedRows();
         List<GwtArtifact> out = new ArrayList<>();
         for (int selectedRow : selectedRows) {
-            int row = artifactsTable.convertRowIndexToModel(selectedRow);
-            String host = String.valueOf(artifactsModel.getValueAt(row, 0));
-            String path = String.valueOf(artifactsModel.getValueAt(row, 1));
-            String type = String.valueOf(artifactsModel.getValueAt(row, 2));
+            int row = dashboard.artifactsTable.convertRowIndexToModel(selectedRow);
+            String host = String.valueOf(dashboard.artifactsModel.getValueAt(row, 0));
+            String path = String.valueOf(dashboard.artifactsModel.getValueAt(row, 1));
+            String type = String.valueOf(dashboard.artifactsModel.getValueAt(row, 2));
             GwtArtifact artifact = artifactStore.find(host, path, type);
             if (artifact != null) {
                 out.add(artifact);
@@ -989,7 +806,7 @@ public class Extension implements BurpExtension, HttpHandler, PassiveScanCheck, 
         }
 
         AnalysisAccumulator acc = new AnalysisAccumulator();
-        boolean deepCacheLookup = fastAnalyzeCheckBox == null || !fastAnalyzeCheckBox.isSelected();
+        boolean deepCacheLookup = dashboard == null || !dashboard.fastAnalyzeCheckBox.isSelected();
         for (GwtArtifact artifact : selected) {
             analyzeArtifactInto(acc, artifact, true, deepCacheLookup);
         }
@@ -997,16 +814,16 @@ public class Extension implements BurpExtension, HttpHandler, PassiveScanCheck, 
     }
 
     private void analyzeHttpHistory() {
-        if (cancelHistoryButton.isEnabled()) {
+        if (historyFuture != null && !historyFuture.isDone()) {
             return;
         }
 
         cancelHistoryFlag.set(false);
-        cancelHistoryButton.setEnabled(true);
-        historyProgressLabel.setText("Running...");
+        dashboard.cancelHistoryButton.setEnabled(true);
+        dashboard.historyProgressLabel.setText("Running...");
         setAnalysisText("Analyzing full HTTP proxy history...", Collections.emptyList(), "", "History Analysis Started");
 
-        new Thread(() -> {
+        historyFuture = historyExecutor.submit(() -> {
             AnalysisAccumulator acc = new AnalysisAccumulator();
             int total = 0;
             int matched = 0;
@@ -1019,36 +836,20 @@ public class Extension implements BurpExtension, HttpHandler, PassiveScanCheck, 
                     }
 
                     HttpRequest req = item.request();
-                    if (scopeOnlyHistoryCheckBox.isSelected() && !req.isInScope()) {
+                    if (dashboard.scopeOnlyHistoryCheckBox.isSelected() && !req.isInScope()) {
                         continue;
                     }
 
                     total++;
                     HttpResponse resp = item.hasResponse() ? item.response() : null;
                     HttpRequestResponse message = item.hasResponse() ? httpRequestResponse(req, resp) : null;
-                    boolean rowMatched = false;
 
                     String reqPath = req.pathWithoutQuery();
                     String reqUrl = req.url();
                     String reqHost = req.httpService().host();
-                    if (GwtDetector.isPotentialGwtPath(reqPath)) {
-                        String type = GwtDetector.classifyArtifact(reqPath);
-                        artifactsAdded += recordArtifactFromHistory(reqHost, reqPath, type, reqUrl, "history request path", req, message);
-                        rowMatched = true;
-                    }
-                    if (GwtDetector.looksLikeGwtRpcRequest(req)) {
-                        artifactsAdded += recordArtifactFromHistory(reqHost, reqPath, "GWT RPC Endpoint", reqUrl, "history rpc request", req, message);
-                        rowMatched = true;
-                    }
-
-                    if (item.hasResponse()) {
-                        String body = safe(resp.bodyToString());
-                        for (String found : GwtDetector.extractArtifactPaths(body)) {
-                            String resolved = GwtDetector.resolvePath(reqUrl, found);
-                            artifactsAdded += recordArtifactFromHistory(reqHost, found, GwtDetector.classifyArtifact(found), resolved, "history response body", req, message);
-                            rowMatched = true;
-                        }
-                    }
+                    int added = detectAndRecordArtifacts(req, message, "history");
+                    boolean rowMatched = added > 0;
+                    artifactsAdded += added;
                     if (rowMatched) {
                         matched++;
                         analyzeArtifactInto(acc, new GwtArtifact(reqHost, reqPath, "History Entry", reqUrl, "history", now(), req, message), false, false);
@@ -1056,7 +857,7 @@ public class Extension implements BurpExtension, HttpHandler, PassiveScanCheck, 
 
                     if (total % 100 == 0) {
                         int progressCount = total;
-                        SwingUtilities.invokeLater(() -> historyProgressLabel.setText("Processed " + progressCount + " items"));
+                        SwingUtilities.invokeLater(() -> dashboard.historyProgressLabel.setText("Processed " + progressCount + " items"));
                     }
                 }
 
@@ -1073,17 +874,17 @@ public class Extension implements BurpExtension, HttpHandler, PassiveScanCheck, 
 
                 SwingUtilities.invokeLater(() -> {
                     setAnalysisText(acc.summary.toString(), new ArrayList<>(acc.methods), acc.headers.toString(), "History Analysis Result");
-                    historyProgressLabel.setText(cancelHistoryFlag.get() ? "Canceled" : "Done");
-                    cancelHistoryButton.setEnabled(false);
+                    dashboard.historyProgressLabel.setText(cancelHistoryFlag.get() ? "Canceled" : "Done");
+                    dashboard.cancelHistoryButton.setEnabled(false);
                 });
             } catch (Exception ex) {
                 SwingUtilities.invokeLater(() -> {
                     setAnalysisText("History analysis failed: " + ex.getMessage(), Collections.emptyList(), "", "History Analysis Failed");
-                    historyProgressLabel.setText("Failed");
-                    cancelHistoryButton.setEnabled(false);
+                    dashboard.historyProgressLabel.setText("Failed");
+                    dashboard.cancelHistoryButton.setEnabled(false);
                 });
             }
-        }, "gwt-history-analysis").start();
+        });
     }
 
     private List<HttpRequestResponse> selectedRequestResponsesFromContext(ContextMenuEvent event) {
@@ -1107,23 +908,10 @@ public class Extension implements BurpExtension, HttpHandler, PassiveScanCheck, 
             String reqPath = req.pathWithoutQuery();
             String reqUrl = req.url();
             String reqHost = req.httpService().host();
-            boolean matched = false;
 
-            if (GwtDetector.isPotentialGwtPath(reqPath)) {
-                added += recordArtifactFromHistory(reqHost, reqPath, GwtDetector.classifyArtifact(reqPath), reqUrl, "context request path", req, rr);
-                matched = true;
-            }
-            if (GwtDetector.looksLikeGwtRpcRequest(req)) {
-                added += recordArtifactFromHistory(reqHost, reqPath, "GWT RPC Endpoint", reqUrl, "context rpc request", req, rr);
-                matched = true;
-            }
-            if (rr.hasResponse()) {
-                for (String found : GwtDetector.extractArtifactPaths(safe(rr.response().bodyToString()))) {
-                    String resolved = GwtDetector.resolvePath(reqUrl, found);
-                    added += recordArtifactFromHistory(reqHost, found, GwtDetector.classifyArtifact(found), resolved, "context response body", req, rr);
-                    matched = true;
-                }
-            }
+            int found = detectAndRecordArtifacts(req, rr, "context");
+            added += found;
+            boolean matched = found > 0;
 
             if (matched) {
                 analyzed++;
@@ -1236,6 +1024,32 @@ public class Extension implements BurpExtension, HttpHandler, PassiveScanCheck, 
         return spans;
     }
 
+    private int detectAndRecordArtifacts(HttpRequest req, HttpRequestResponse message,
+                                         String sourceLabel) {
+        int count = 0;
+        String reqPath = req.pathWithoutQuery();
+        String reqUrl = req.url();
+        String reqHost = req.httpService().host();
+        if (GwtDetector.isPotentialGwtPath(reqPath)) {
+            count += recordArtifactFromHistory(reqHost, reqPath, GwtDetector.classifyArtifact(reqPath),
+                    reqUrl, sourceLabel + " request path", req, message);
+        }
+        if (GwtDetector.looksLikeGwtRpcRequest(req)) {
+            count += recordArtifactFromHistory(reqHost, reqPath, "GWT RPC Endpoint",
+                    reqUrl, sourceLabel + " rpc request", req, message);
+        }
+        if (message != null && message.hasResponse()) {
+            String body = safe(message.response().bodyToString());
+            for (String found : GwtDetector.extractArtifactPaths(body)) {
+                String resolved = GwtDetector.resolvePath(reqUrl, found);
+                count += recordArtifactFromHistory(GwtDetector.hostFromUrl(reqUrl), found,
+                        GwtDetector.classifyArtifact(found), resolved,
+                        sourceLabel + " response body", req, message);
+            }
+        }
+        return count;
+    }
+
     private int recordArtifactFromHistory(String host, String path, String type, String resolvedUrl, String source, HttpRequest sourceRequest, HttpRequestResponse sourceMessage) {
         return recordArtifact(host, path, type, resolvedUrl, source, sourceRequest, sourceMessage) ? 1 : 0;
     }
@@ -1273,12 +1087,12 @@ public class Extension implements BurpExtension, HttpHandler, PassiveScanCheck, 
             int bytes = artifact.sourceMessage.response().toByteArray().length();
             acc.summary.append("Response Size: ").append(bytes).append(" bytes\n");
             if (bytes <= PREVIEW_MAX_BYTES) {
-                String version = extractGwtVersion(responseBody);
+                String version = MethodExtractor.extractGwtVersion(responseBody);
                 if (!version.isEmpty()) {
                     acc.summary.append("GWT Version Hint: ").append(version).append('\n');
                 }
-                acc.methods.addAll(extractMethodHints(responseBody));
-                acc.methods.addAll(extractCacheMethodsLikeGwtMap(responseBody));
+                acc.methods.addAll(MethodExtractor.extractMethodHints(responseBody));
+                acc.methods.addAll(MethodExtractor.extractCacheMethodsLikeGwtMap(responseBody));
             } else {
                 acc.summary.append("Response body skipped (TOO BIG FILE)\n");
             }
@@ -1330,7 +1144,8 @@ public class Extension implements BurpExtension, HttpHandler, PassiveScanCheck, 
                     moduleBase = safe(h.value()).trim();
                 }
             }
-        } catch (Exception ignored) {
+        } catch (Exception ex) {
+            api.logging().logToError("[GWT Mapper] Cache header extraction failed: " + ex.getMessage());
             return "";
         }
         if (permutation.isEmpty() || moduleBase.isEmpty()) {
@@ -1370,12 +1185,13 @@ public class Extension implements BurpExtension, HttpHandler, PassiveScanCheck, 
                         rr
                 );
             }
-            Set<String> methods = extractCacheMethodsLikeGwtMap(body);
+            Set<String> methods = MethodExtractor.extractCacheMethodsLikeGwtMap(body);
             if (methods.isEmpty()) {
                 return "Related cache.js analyzed, no method hints extracted: " + cacheUrl;
             }
             return "Related cache.js method hints (" + methods.size() + "): " + String.join(", ", methods.stream().limit(20).toList());
-        } catch (Exception ignored) {
+        } catch (Exception ex) {
+            api.logging().logToError("[GWT Mapper] Related cache analysis failed: " + ex.getMessage());
             return "";
         }
     }
@@ -1398,183 +1214,178 @@ public class Extension implements BurpExtension, HttpHandler, PassiveScanCheck, 
         return "";
     }
 
-    private String extractGwtVersion(String body) {
-        List<Pattern> patterns = List.of(
-                Pattern.compile("gwtVersion\\s*[:=]\\s*[\"']([^\"']+)[\"']", Pattern.CASE_INSENSITIVE),
-                Pattern.compile("GWT_VERSION\\s*[:=]\\s*[\"']([^\"']+)[\"']", Pattern.CASE_INSENSITIVE),
-                Pattern.compile("Google Web Toolkit\\s*([0-9]+(?:\\.[0-9]+)+)", Pattern.CASE_INSENSITIVE)
-        );
-        for (Pattern p : patterns) {
-            Matcher m = p.matcher(body);
-            if (m.find()) {
-                return m.group(1);
-            }
-        }
-        return "";
-    }
+    private final class DashboardPanel extends JPanel {
+        final DefaultTableModel artifactsModel;
+        final JTable artifactsTable;
+        final TableRowSorter<DefaultTableModel> rowSorter;
+        final JTextField outputFolderField;
+        final JTextField passiveMaxBodyBytesField;
+        final JTextField filterField;
+        final JCheckBox passiveScanCheckBox;
+        final JCheckBox scopeOnlyHistoryCheckBox;
+        final JCheckBox fastAnalyzeCheckBox;
+        final JButton cancelHistoryButton;
+        final JLabel historyProgressLabel;
+        final HttpRequestEditor requestPreviewEditor;
+        final HttpResponseEditor responsePreviewEditor;
+        final JTextArea analysisSummaryArea;
+        final JTextArea analysisHeadersArea;
+        final JTextArea analysisRunsArea;
+        final DefaultTableModel methodsTableModel;
+        final JTable methodsTable;
+        final JTabbedPane analysisTabs;
 
-    // Heuristics adapted from reference/gwtmap.py and reference/gwtmap_ng.py
-    private Set<String> extractCacheMethodsLikeGwtMap(String body) {
-        Set<String> methods = new LinkedHashSet<>();
-        String source = safe(body);
-        if (source.isEmpty()) {
-            return methods;
-        }
+        DashboardPanel() {
+            super(new BorderLayout());
 
-        String normalized = normalizeCacheCodeForHeuristics(source);
-        String[] lines = normalized.split("\\n");
+            JPanel top = new JPanel(new GridLayout(3, 1, 6, 6));
+            JPanel row1 = new JPanel(new FlowLayout(FlowLayout.LEFT));
+            JPanel row2 = new JPanel(new FlowLayout(FlowLayout.LEFT));
+            JPanel row3 = new JPanel(new FlowLayout(FlowLayout.LEFT));
 
-        // obfuscatedVar='literal' and obfuscatedVar="literal"
-        var stringVars = new java.util.HashMap<String, String>();
-        Matcher assign = Pattern.compile("([A-Za-z0-9_$]+)=['\"]([^'\"]*)['\"]").matcher(normalized);
-        while (assign.find()) {
-            stringVars.put(assign.group(1), assign.group(2));
-        }
+            outputFolderField = new JTextField(loadOutputDirectory(), 45);
+            passiveMaxBodyBytesField = new JTextField(String.valueOf(passiveMaxBodyBytes), 8);
 
-        String invokeFn = detectRpcInvokeFunction(lines);
-        Pattern newLit = Pattern.compile("new\\s+[A-Za-z0-9_.$]+\\([^;]*,\\s*([A-Za-z0-9_$]+)\\s*,\\s*'([^']+)'\\s*\\)");
-        Pattern newVar = Pattern.compile("new\\s+[A-Za-z0-9_.$]+\\([^;]*,\\s*([A-Za-z0-9_$]+)\\s*,\\s*([A-Za-z0-9_$]+)\\s*\\)");
-        Pattern invokeLiteralIface = Pattern.compile("\\b([A-Za-z0-9_$]+)\\([^;]*'((?:com|org|net)\\.[^']+)'\\s*,\\s*(\\d+)\\s*\\)");
-        Pattern methodNamePattern = Pattern.compile("^[A-Za-z0-9_$]+$");
+            JButton browseButton = new JButton("Browse...");
+            browseButton.addActionListener(e -> chooseFolder());
 
-        Pattern invokeByFunction = null;
-        if (!invokeFn.isEmpty()) {
-            invokeByFunction = Pattern.compile("\\b" + Pattern.quote(invokeFn) + "\\([^;]*,\\s*([A-Za-z0-9_$]+|'[^']+')\\s*,\\s*(\\d+)\\s*\\)");
-        }
+            JButton saveSettingsButton = new JButton("Save Settings");
+            saveSettingsButton.addActionListener(e -> persistSettings());
 
-        for (int i = 0; i < lines.length; i++) {
-            String line = lines[i];
-            String methodName = null;
+            passiveScanCheckBox = new JCheckBox("Enable Passive Scan", loadPassiveScanEnabled());
+            passiveScanCheckBox.addActionListener(e -> persistSettings());
 
-            Matcher m1 = newLit.matcher(line);
-            if (m1.find()) {
-                methodName = m1.group(2);
-            } else {
-                Matcher m2 = newVar.matcher(line);
-                if (m2.find()) {
-                    methodName = stringVars.getOrDefault(m2.group(2), "");
+            JButton downloadSelectedButton = new JButton("Download Selected");
+            downloadSelectedButton.addActionListener(e -> downloadSelected());
+
+            JButton downloadAllButton = new JButton("Download All");
+            downloadAllButton.addActionListener(e -> downloadAll());
+
+            JButton tempFolderButton = new JButton("Use Temporary Folder");
+            tempFolderButton.addActionListener(e -> useTempFolder());
+
+            JButton clearButton = new JButton("Clear Artifacts");
+            clearButton.addActionListener(e -> clearArtifacts());
+
+            JButton exportCsvButton = new JButton("Export CSV");
+            exportCsvButton.addActionListener(e -> exportCsv());
+            JButton exportMethodsButton = new JButton("Export Methods");
+            exportMethodsButton.addActionListener(e -> exportMethodsCsv());
+            JButton analyzeSelectedButton = new JButton("Analyze Selected Item(s)");
+            analyzeSelectedButton.addActionListener(e -> analyzeSelectedArtifacts());
+            JButton analyzeHistoryButton = new JButton("Analyze HTTP History");
+            analyzeHistoryButton.addActionListener(e -> analyzeHttpHistory());
+            cancelHistoryButton = new JButton("Cancel History Analysis");
+            cancelHistoryButton.setEnabled(false);
+            cancelHistoryButton.addActionListener(e -> cancelHistoryFlag.set(true));
+
+            filterField = new JTextField(28);
+            JButton applyFilterButton = new JButton("Apply Filter");
+            applyFilterButton.addActionListener(e -> applyFilter());
+            scopeOnlyHistoryCheckBox = new JCheckBox("Scope-Only History", loadScopeOnlyHistory());
+            scopeOnlyHistoryCheckBox.addActionListener(e -> persistSettings());
+            fastAnalyzeCheckBox = new JCheckBox("Fast Analyze (skip cache fetch)", loadFastAnalyze());
+            fastAnalyzeCheckBox.addActionListener(e -> persistSettings());
+            historyProgressLabel = new JLabel("Idle");
+
+            row1.add(new JLabel("Download Folder:"));
+            row1.add(outputFolderField);
+            row1.add(browseButton);
+            row1.add(saveSettingsButton);
+            row1.add(passiveScanCheckBox);
+            row1.add(new JLabel("Passive Max Body (bytes):"));
+            row1.add(passiveMaxBodyBytesField);
+
+            row2.add(downloadSelectedButton);
+            row2.add(downloadAllButton);
+            row2.add(tempFolderButton);
+            row2.add(clearButton);
+            row2.add(exportCsvButton);
+            row2.add(exportMethodsButton);
+            row2.add(analyzeSelectedButton);
+            row2.add(analyzeHistoryButton);
+
+            row3.add(new JLabel("Filter:"));
+            row3.add(filterField);
+            row3.add(applyFilterButton);
+            row3.add(scopeOnlyHistoryCheckBox);
+            row3.add(fastAnalyzeCheckBox);
+            row3.add(cancelHistoryButton);
+            row3.add(historyProgressLabel);
+
+            top.add(row1);
+            top.add(row2);
+            top.add(row3);
+
+            artifactsModel = new DefaultTableModel(new Object[]{
+                    "Host", "Artifact Path", "Type", "Resolved URL", "Source", "Discovered At"
+            }, 0) {
+                @Override
+                public boolean isCellEditable(int row, int column) {
+                    return false;
                 }
-            }
-            if (methodName == null || methodName.isEmpty() || !methodNamePattern.matcher(methodName).matches()) {
-                continue;
-            }
+            };
 
-            String iface = "";
-            int forwardTo = Math.min(lines.length, i + 30);
-            for (int j = i; j < forwardTo; j++) {
-                if (invokeByFunction != null) {
-                    Matcher byFunc = invokeByFunction.matcher(lines[j]);
-                    if (byFunc.find()) {
-                        iface = byFunc.group(1).replace("'", "");
-                        break;
-                    }
+            artifactsTable = new JTable(artifactsModel);
+            rowSorter = new TableRowSorter<>(artifactsModel);
+            artifactsTable.setRowSorter(rowSorter);
+            artifactsTable.getSelectionModel().addListSelectionListener(e -> {
+                if (!e.getValueIsAdjusting()) {
+                    updateSelectedPreview();
                 }
-                Matcher inv = invokeLiteralIface.matcher(lines[j]);
-                if (inv.find()) {
-                    iface = inv.group(2);
-                    break;
+            });
+
+            requestPreviewEditor = api.userInterface().createHttpRequestEditor(EditorOptions.READ_ONLY);
+            responsePreviewEditor = api.userInterface().createHttpResponseEditor(EditorOptions.READ_ONLY);
+            analysisSummaryArea = createReadOnlyTextArea();
+            analysisHeadersArea = createReadOnlyTextArea();
+            analysisRunsArea = createReadOnlyTextArea();
+            methodsTableModel = new DefaultTableModel(new Object[]{"Method"}, 0) {
+                @Override
+                public boolean isCellEditable(int row, int column) {
+                    return false;
                 }
-            }
-            if (iface.isEmpty()) {
-                int backwardFrom = Math.max(0, i - 10);
-                for (int j = backwardFrom; j < i; j++) {
-                    if (invokeByFunction != null) {
-                        Matcher byFunc = invokeByFunction.matcher(lines[j]);
-                        if (byFunc.find()) {
-                            iface = byFunc.group(1).replace("'", "");
-                            break;
-                        }
-                    }
-                    Matcher inv = invokeLiteralIface.matcher(lines[j]);
-                    if (inv.find()) {
-                        iface = inv.group(2);
-                        break;
-                    }
-                }
-            }
-            iface = stringVars.getOrDefault(iface, iface);
+            };
+            methodsTable = new JTable(methodsTableModel);
+            methodsTable.setRowSorter(new TableRowSorter<>(methodsTableModel));
+            analysisTabs = new JTabbedPane();
+            analysisTabs.addTab("Summary", new JScrollPane(analysisSummaryArea));
+            analysisTabs.addTab("Methods", new JScrollPane(methodsTable));
+            analysisTabs.addTab("Headers", new JScrollPane(analysisHeadersArea));
+            analysisTabs.addTab("Runs", new JScrollPane(analysisRunsArea));
+            requestPreviewEditor.setRequest(placeholderRequest("Select an artifact row to preview request."));
+            responsePreviewEditor.setResponse(placeholderResponse("Select an artifact row to preview response."));
+            String initMsg = "Click 'Analyze Selected Item(s)' to extract GWT methods/version/headers.";
+            analysisSummaryArea.setText(initMsg);
+            analysisHeadersArea.setText("");
+            analysisRunsArea.insert("=== Initial State ===\n" + initMsg + "\n\n", 0);
 
-            if (iface.startsWith("com.") || iface.startsWith("org.") || iface.startsWith("net.")) {
-                methods.add(iface + "::" + methodName);
-            } else {
-                methods.add(methodName);
-            }
-            if (methods.size() >= 200) {
-                break;
-            }
+            JPanel previews = new JPanel(new GridLayout(1, 3, 6, 6));
+            previews.add(wrapTitled("Request Preview", requestPreviewEditor.uiComponent()));
+            previews.add(wrapTitled("Response Preview", responsePreviewEditor.uiComponent()));
+            previews.add(wrapTitled("Analysis", analysisTabs));
+
+            JSplitPane split = new JSplitPane(JSplitPane.VERTICAL_SPLIT, new JScrollPane(artifactsTable), previews);
+            split.setResizeWeight(0.60);
+
+            add(top, BorderLayout.NORTH);
+            add(split, BorderLayout.CENTER);
         }
 
-        return methods;
-    }
-
-    private String normalizeCacheCodeForHeuristics(String source) {
-        if (source.startsWith("function")) {
-            return source;
-        }
-        return source
-                .replace("{", "{\n")
-                .replace("}", "\n}\n")
-                .replace(";", ";\n");
-    }
-
-    private String detectRpcInvokeFunction(String[] codeLines) {
-        Pattern fnPattern = Pattern.compile("^function\\s+([A-Za-z0-9_$]+)\\(a,b,c\\)\\{");
-        for (int i = 0; i < codeLines.length; i++) {
-            Matcher m = fnPattern.matcher(codeLines[i].trim());
-            if (!m.find()) {
-                continue;
-            }
-            String name = m.group(1);
-            int jUb = 0;
-            int hUb = 0;
-            for (int j = i + 1; j < Math.min(i + 25, codeLines.length); j++) {
-                if (codeLines[j].contains("JUb(")) {
-                    jUb++;
-                }
-                if (codeLines[j].contains("HUb(")) {
-                    hUb++;
-                }
-                if (codeLines[j].trim().equals("}")) {
-                    break;
-                }
-            }
-            if (jUb >= 2 && hUb >= 1) {
-                return name;
-            }
+        private JTextArea createReadOnlyTextArea() {
+            JTextArea area = new JTextArea();
+            area.setEditable(false);
+            area.setLineWrap(true);
+            area.setWrapStyleWord(true);
+            return area;
         }
 
-        Pattern literalPattern = Pattern.compile("\\b([A-Za-z0-9_$]+)\\([^;]*'com\\.[^']+'\\s*,\\s*\\d+\\s*\\)");
-        var candidates = new java.util.HashMap<String, Integer>();
-        for (String line : codeLines) {
-            Matcher matcher = literalPattern.matcher(line);
-            if (matcher.find()) {
-                String candidate = matcher.group(1);
-                candidates.put(candidate, candidates.getOrDefault(candidate, 0) + 1);
-            }
+        private JPanel wrapTitled(String title, Component component) {
+            JPanel panel = new JPanel(new BorderLayout());
+            panel.setBorder(BorderFactory.createTitledBorder(title));
+            panel.add(component, BorderLayout.CENTER);
+            return panel;
         }
-
-        String best = "";
-        int bestScore = 0;
-        for (var entry : candidates.entrySet()) {
-            if (entry.getValue() > bestScore) {
-                best = entry.getKey();
-                bestScore = entry.getValue();
-            }
-        }
-        return best;
-    }
-
-    private Set<String> extractMethodHints(String body) {
-        Set<String> methods = new LinkedHashSet<>();
-        Matcher rpcStyle = Pattern.compile("([A-Za-z0-9_$.]+)::([A-Za-z0-9_]+)\\(").matcher(body);
-        while (rpcStyle.find() && methods.size() < 20) {
-            methods.add(rpcStyle.group(1) + "::" + rpcStyle.group(2));
-        }
-        Matcher jsCalls = Pattern.compile("\\.([A-Za-z_][A-Za-z0-9_]{2,})\\(").matcher(body);
-        while (jsCalls.find() && methods.size() < 20) {
-            methods.add(jsCalls.group(1));
-        }
-        return methods;
     }
 
     private static final class AnalysisAccumulator {
