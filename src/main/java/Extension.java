@@ -53,6 +53,7 @@ import java.awt.Component;
 import java.awt.FlowLayout;
 import java.awt.GridLayout;
 import java.io.BufferedWriter;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -60,8 +61,10 @@ import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
@@ -69,6 +72,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.regex.Pattern;
 
 import static burp.api.montoya.core.Range.range;
@@ -94,6 +98,7 @@ public class Extension implements BurpExtension, HttpHandler, PassiveScanCheck, 
     private ExecutorService passiveExecutor;
     private ExecutorService historyExecutor;
     private ExecutorService downloadExecutor;
+    private ExecutorService pentestExecutor;
     private volatile Future<?> historyFuture;
 
     private JPanel mainPanel;
@@ -102,6 +107,8 @@ public class Extension implements BurpExtension, HttpHandler, PassiveScanCheck, 
     private JTable methodsCatalogTable;
     private final Set<String> methodsCatalogSet = ConcurrentHashMap.newKeySet();
     private final Set<String> expandedNoCacheUrls = ConcurrentHashMap.newKeySet();
+    private final Map<String, MethodObservation> methodObservations = new ConcurrentHashMap<>();
+    private final Map<String, MethodRiskState> methodRiskStates = new ConcurrentHashMap<>();
     private final AtomicBoolean cancelHistoryFlag = new AtomicBoolean(false);
     private JTabbedPane workTabs;
     private int analysisRunCounter = 0;
@@ -128,6 +135,11 @@ public class Extension implements BurpExtension, HttpHandler, PassiveScanCheck, 
         });
         this.downloadExecutor = Executors.newSingleThreadExecutor(r -> {
             Thread t = new Thread(r, "gwt-download-worker");
+            t.setDaemon(true);
+            return t;
+        });
+        this.pentestExecutor = Executors.newSingleThreadExecutor(r -> {
+            Thread t = new Thread(r, "gwt-pentest-worker");
             t.setDaemon(true);
             return t;
         });
@@ -171,7 +183,16 @@ public class Extension implements BurpExtension, HttpHandler, PassiveScanCheck, 
 
         if (GwtDetector.looksLikeGwtRpcRequest(req)) {
             recordArtifact(req.httpService().host(), reqPath, "GWT RPC Endpoint", reqUrl, "rpc request", req, requestResponse);
+            observeMethodInvocation(req, reqUrl, "passive");
             findings.add("Detected GWT RPC request format or headers at: <code>" + reqUrl + "</code>");
+            Optional<GwtRpcSemanticParser.SemanticRequest> semantic = GwtRpcSemanticParser.parseRequest(req.bodyToString());
+            if (semantic.isPresent()) {
+                GwtRiskSignals.Signals signals = GwtRiskSignals.fromSemantic(semantic.get());
+                int authContextCount = methodAuthContextCount(signals.methodKey());
+                for (String infoFinding : GwtRiskSignals.buildInformationalFindings(signals, authContextCount)) {
+                    findings.add(escapeHtml(infoFinding));
+                }
+            }
         }
 
         if (requestResponse.hasResponse()) {
@@ -244,6 +265,7 @@ public class Extension implements BurpExtension, HttpHandler, PassiveScanCheck, 
 
             if (GwtDetector.looksLikeGwtRpcRequest(reqCopy)) {
                 recordArtifact(reqCopy.httpService().host(), reqPath, "GWT RPC Endpoint", reqCopy.url(), "rpc request", reqCopy, null);
+                observeMethodInvocation(reqCopy, reqCopy.url(), "http-handler");
             }
         });
 
@@ -306,9 +328,17 @@ public class Extension implements BurpExtension, HttpHandler, PassiveScanCheck, 
         JMenuItem sendToIntruder = new JMenuItem("GWT: Send Request -> Intruder (auto positions)");
         sendToIntruder.addActionListener(e -> sendFromContextToIntruder(selected));
 
+        JMenuItem queueIdorToIntruder = new JMenuItem("GWT: Queue IDOR Candidates -> Intruder");
+        queueIdorToIntruder.addActionListener(e -> queueIdorFromContext(selected));
+
+        JMenuItem replayMutations = new JMenuItem("GWT: Replay Mutations + Probes");
+        replayMutations.addActionListener(e -> replayMutationsFromContext(selected));
+
         List<Component> menu = new ArrayList<>();
         menu.add(analyzeToDashboard);
         menu.add(sendToIntruder);
+        menu.add(queueIdorToIntruder);
+        menu.add(replayMutations);
         return menu;
     }
 
@@ -413,9 +443,13 @@ public class Extension implements BurpExtension, HttpHandler, PassiveScanCheck, 
 
     private void clearArtifacts() {
         artifactStore.clear();
+        methodObservations.clear();
+        methodRiskStates.clear();
         dashboard.artifactsModel.setRowCount(0);
+        dashboard.methodMapTableModel.setRowCount(0);
         dashboard.requestPreviewEditor.setRequest(placeholderRequest("Select an artifact row to preview request."));
         dashboard.responsePreviewEditor.setResponse(placeholderResponse("Select an artifact row to preview response."));
+        dashboard.pentestArea.setText("Use 'Queue IDOR -> Intruder' or 'Replay Mutations' to accelerate BAC and injection testing.\n");
         setAnalysisText(
                 "Click 'Analyze Selected Item(s)' to extract GWT methods/version/headers.",
                 Collections.emptyList(),
@@ -990,6 +1024,263 @@ public class Extension implements BurpExtension, HttpHandler, PassiveScanCheck, 
         });
     }
 
+    private void queueIdorFromSelection() {
+        List<HttpRequest> requests = new ArrayList<>();
+        for (GwtArtifact artifact : selectedArtifacts()) {
+            if (artifact.sourceRequest != null) {
+                requests.add(artifact.sourceRequest);
+            }
+        }
+        queueIdorRequests(requests, "Selection");
+    }
+
+    private void queueIdorFromContext(List<HttpRequestResponse> selected) {
+        List<HttpRequest> requests = new ArrayList<>();
+        for (HttpRequestResponse rr : selected) {
+            requests.add(rr.request());
+        }
+        queueIdorRequests(requests, "Context");
+    }
+
+    private void queueIdorRequests(List<HttpRequest> requests, String sourceLabel) {
+        int sent = 0;
+        int candidates = 0;
+        for (HttpRequest req : requests) {
+            if (!GwtDetector.looksLikeGwtRpcRequest(req)) {
+                continue;
+            }
+            Optional<GwtRpcSemanticParser.SemanticRequest> parsed = GwtRpcSemanticParser.parseRequest(req.bodyToString());
+            if (parsed.isEmpty()) {
+                continue;
+            }
+            GwtRpcSemanticParser.SemanticRequest semantic = parsed.get();
+            List<GwtPentestHeuristics.IdCandidate> idCandidates = GwtPentestHeuristics.extractIdCandidates(semantic);
+            if (idCandidates.isEmpty()) {
+                continue;
+            }
+            int bodyOffset = req.bodyOffset();
+            List<burp.api.montoya.core.Range> ranges = new ArrayList<>();
+            for (GwtPentestHeuristics.IdCandidate c : idCandidates) {
+                if (c.mutationTokenIndex() < 0 || c.mutationTokenIndex() >= semantic.tokens().size()) {
+                    continue;
+                }
+                GwtRpcSemanticParser.TokenSpan token = semantic.tokens().get(c.mutationTokenIndex());
+                ranges.add(range(bodyOffset + token.start(), bodyOffset + token.end()));
+                candidates++;
+            }
+            if (ranges.isEmpty()) {
+                continue;
+            }
+            String tabName = semantic.methodKey().isEmpty() ? "GWT-IDOR" : semantic.methodKey() + " IDOR";
+            HttpRequestTemplate template = HttpRequestTemplate.httpRequestTemplate(req, ranges);
+            api.intruder().sendToIntruder(req.httpService(), template, tabName);
+            sent++;
+            appendPentestLog("Queued IDOR candidate set for " + tabName + " (" + ranges.size() + " insertion points)");
+        }
+
+        final int finalSent = sent;
+        final int finalCandidates = candidates;
+        SwingUtilities.invokeLater(() -> {
+            String msg = finalSent == 0
+                    ? sourceLabel + ": no ID-like parameters found in selected GWT RPC requests."
+                    : sourceLabel + ": queued " + finalSent + " request(s) to Intruder with " + finalCandidates + " ID candidate insertion point(s).";
+            setAnalysisText(msg, Collections.emptyList(), "", sourceLabel + " IDOR Queue");
+            workTabs.setSelectedIndex(0);
+            int pentestTab = dashboard.analysisTabs.indexOfTab("Pentest");
+            if (pentestTab >= 0) {
+                dashboard.analysisTabs.setSelectedIndex(pentestTab);
+            }
+        });
+    }
+
+    private void replayMutationsFromSelection() {
+        List<HttpRequest> requests = new ArrayList<>();
+        for (GwtArtifact artifact : selectedArtifacts()) {
+            if (artifact.sourceRequest != null) {
+                requests.add(artifact.sourceRequest);
+            }
+        }
+        replayMutations(requests, "Selection");
+    }
+
+    private void replayMutationsFromContext(List<HttpRequestResponse> selected) {
+        List<HttpRequest> requests = new ArrayList<>();
+        for (HttpRequestResponse rr : selected) {
+            requests.add(rr.request());
+        }
+        replayMutations(requests, "Context");
+    }
+
+    private void replayMutations(List<HttpRequest> requests, String sourceLabel) {
+        if (requests.isEmpty()) {
+            setAnalysisText(sourceLabel + ": no requests to replay.", Collections.emptyList(), "", sourceLabel + " Mutation Replay");
+            return;
+        }
+        pentestExecutor.submit(() -> {
+            int requestCount = 0;
+            int replayed = 0;
+            int responses = 0;
+            int artifactsAdded = 0;
+            Map<String, Integer> probeTypes = new HashMap<>();
+
+            for (HttpRequest req : requests) {
+                if (!GwtDetector.looksLikeGwtRpcRequest(req)) {
+                    continue;
+                }
+                Optional<GwtRpcSemanticParser.SemanticRequest> parsed = GwtRpcSemanticParser.parseRequest(req.bodyToString());
+                if (parsed.isEmpty()) {
+                    continue;
+                }
+                requestCount++;
+                GwtRpcSemanticParser.SemanticRequest semantic = parsed.get();
+                List<GwtPentestHeuristics.MutationPlan> plans = GwtPentestHeuristics.buildMutationPlans(semantic, 12);
+                if (plans.isEmpty()) {
+                    continue;
+                }
+                String methodKey = semantic.methodKey().isEmpty() ? "GWT-RPC" : semantic.methodKey();
+                for (GwtPentestHeuristics.MutationPlan plan : plans) {
+                    try {
+                        String mutatedBody = GwtRpcSemanticParser.rebuildBody(semantic, plan.tokenIndex(), plan.replacement());
+                        HttpRequest mutated = replaceRequestBody(req, mutatedBody);
+                        HttpRequestResponse response = api.http().sendRequest(mutated);
+                        replayed++;
+                        if (response.hasResponse()) {
+                            responses++;
+                            artifactsAdded += detectAndRecordArtifacts(mutated, response, "mutation replay", passiveMaxBodyBytes);
+                        }
+                        probeTypes.put(plan.reason(), probeTypes.getOrDefault(plan.reason(), 0) + 1);
+                        appendPentestLog("Replay [" + methodKey + "] " + plan.reason() + " -> " + truncate(plan.replacement(), 60));
+                    } catch (Exception ex) {
+                        appendPentestLog("Replay failed [" + methodKey + "] " + plan.reason() + ": " + ex.getMessage());
+                    }
+                }
+            }
+
+            StringBuilder summary = new StringBuilder();
+            summary.append(sourceLabel).append(" mutation replay finished.\n");
+            summary.append("Parsed GWT requests: ").append(requestCount).append('\n');
+            summary.append("Mutations sent: ").append(replayed).append('\n');
+            summary.append("Responses received: ").append(responses).append('\n');
+            summary.append("Artifacts added from replay: ").append(artifactsAdded).append('\n');
+            if (!probeTypes.isEmpty()) {
+                summary.append("Mutation categories: ").append(probeTypes).append('\n');
+            }
+            SwingUtilities.invokeLater(() -> {
+                setAnalysisText(summary.toString(), Collections.emptyList(), "", sourceLabel + " Mutation Replay");
+                workTabs.setSelectedIndex(0);
+                int pentestTab = dashboard.analysisTabs.indexOfTab("Pentest");
+                if (pentestTab >= 0) {
+                    dashboard.analysisTabs.setSelectedIndex(pentestTab);
+                }
+            });
+        });
+    }
+
+    private HttpRequest replaceRequestBody(HttpRequest request, String body) {
+        byte[] raw = request.toByteArray().getBytes();
+        int bodyOffset = request.bodyOffset();
+        if (bodyOffset < 0 || bodyOffset > raw.length) {
+            return request;
+        }
+        String full = new String(raw, StandardCharsets.ISO_8859_1);
+        String head = full.substring(0, bodyOffset);
+        String updatedHead = head.replaceAll("(?im)^Content-Length:\\s*\\d+\\s*$", "Content-Length: " + body.getBytes(StandardCharsets.ISO_8859_1).length);
+        return httpRequest(updatedHead + body);
+    }
+
+    private void observeMethodInvocation(HttpRequest req, String sourceUrl, String sourceLabel) {
+        Optional<GwtRpcSemanticParser.SemanticRequest> parsed = GwtRpcSemanticParser.parseRequest(req.bodyToString());
+        if (parsed.isEmpty()) {
+            return;
+        }
+        GwtRpcSemanticParser.SemanticRequest semantic = parsed.get();
+        String methodKey = semantic.methodKey();
+        if (methodKey.isEmpty()) {
+            return;
+        }
+        List<GwtPentestHeuristics.IdCandidate> idCandidates = GwtPentestHeuristics.extractIdCandidates(semantic);
+        int injectionCandidates = GwtPentestHeuristics.countLikelyInjectionParams(semantic);
+        String authContext = authContextFingerprint(req);
+        MethodObservation obs = methodObservations.computeIfAbsent(methodKey, k -> new MethodObservation());
+        obs.record(sourceUrl, sourceLabel, semantic.parameters(), idCandidates.size());
+        MethodRiskState risk = methodRiskStates.computeIfAbsent(methodKey, k -> new MethodRiskState());
+        risk.record(idCandidates.size(), injectionCandidates, authContext);
+        refreshMethodMapUi();
+    }
+
+    private int methodAuthContextCount(String methodKey) {
+        if (safe(methodKey).isEmpty()) {
+            return 0;
+        }
+        MethodRiskState state = methodRiskStates.get(methodKey);
+        return state == null ? 0 : state.authContextCount();
+    }
+
+    private String authContextFingerprint(HttpRequest req) {
+        String authScheme = "";
+        List<String> cookieNames = new ArrayList<>();
+        try {
+            for (var h : req.headers()) {
+                String name = safe(h.name()).toLowerCase();
+                String value = safe(h.value());
+                if ("authorization".equals(name)) {
+                    int idx = value.indexOf(' ');
+                    authScheme = (idx > 0 ? value.substring(0, idx) : value).toLowerCase();
+                } else if ("cookie".equals(name)) {
+                    for (String part : value.split(";")) {
+                        String c = part.trim();
+                        int eq = c.indexOf('=');
+                        if (eq > 0) {
+                            cookieNames.add(c.substring(0, eq).trim().toLowerCase());
+                        }
+                    }
+                }
+            }
+        } catch (Exception ignored) {
+            return "unknown";
+        }
+        Collections.sort(cookieNames);
+        if (authScheme.isEmpty() && cookieNames.isEmpty()) {
+            return "anon";
+        }
+        return "auth=" + authScheme + ";cookies=" + String.join("|", cookieNames);
+    }
+
+    private void refreshMethodMapUi() {
+        SwingUtilities.invokeLater(() -> {
+            if (dashboard == null || dashboard.methodMapTableModel == null) {
+                return;
+            }
+            dashboard.methodMapTableModel.setRowCount(0);
+            for (Map.Entry<String, MethodObservation> entry : methodObservations.entrySet()) {
+                MethodObservationSnapshot s = entry.getValue().snapshot();
+                dashboard.methodMapTableModel.addRow(new Object[]{
+                        entry.getKey(),
+                        s.hits(),
+                        s.endpointCount(),
+                        s.sampleEndpoint(),
+                        s.sampleParams()
+                });
+            }
+        });
+    }
+
+    private void appendPentestLog(String message) {
+        SwingUtilities.invokeLater(() -> {
+            if (dashboard != null && dashboard.pentestArea != null) {
+                dashboard.pentestArea.insert(now() + " - " + safe(message) + "\n", 0);
+            }
+        });
+    }
+
+    private static String truncate(String value, int max) {
+        String v = safe(value);
+        if (v.length() <= max) {
+            return v;
+        }
+        return v.substring(0, Math.max(0, max - 3)) + "...";
+    }
+
     private String detectRpcMethodName(HttpRequest request) {
         List<GwtRpcParser.RpcRow> rows = GwtRpcParser.parseRequest(request.bodyToString());
         return findResolved(rows, "Method Ref");
@@ -1001,55 +1292,23 @@ public class Extension implements BurpExtension, HttpHandler, PassiveScanCheck, 
             return Collections.emptyList();
         }
 
-        List<TokenSpan> tokens = tokenizePipeWithOffsets(body);
-        if (tokens.size() < 8) {
+        Optional<GwtRpcSemanticParser.SemanticRequest> parsed = GwtRpcSemanticParser.parseRequest(body);
+        if (parsed.isEmpty()) {
             return Collections.emptyList();
         }
+        GwtRpcSemanticParser.SemanticRequest semantic = parsed.get();
 
-        int stringCount = parseIntOr(tokens.get(2).text, -1);
-        if (stringCount < 0) {
-            return Collections.emptyList();
-        }
-        int payloadStart = 3 + stringCount;
-        if (payloadStart + 5 > tokens.size()) {
-            return Collections.emptyList();
-        }
-
-        int bodyOffset = request.bodyOffset();
         List<burp.api.montoya.core.Range> ranges = new ArrayList<>();
-        int paramCount = parseIntOr(tokens.get(payloadStart + 4).text, -1);
-        int valuesStart = payloadStart + 5;
-        if (paramCount > 0) {
-            int valuesEnd = Math.min(tokens.size(), valuesStart + paramCount);
-            for (int i = valuesStart; i < valuesEnd; i++) {
-                TokenSpan t = tokens.get(i);
-                ranges.add(range(bodyOffset + t.start, bodyOffset + t.end));
-            }
-        }
-
-        if (ranges.isEmpty()) {
-            for (int i = valuesStart; i < tokens.size(); i++) {
-                TokenSpan t = tokens.get(i);
-                ranges.add(range(bodyOffset + t.start, bodyOffset + t.end));
-            }
-        }
-        return ranges;
-    }
-
-    private List<TokenSpan> tokenizePipeWithOffsets(String body) {
-        List<TokenSpan> spans = new ArrayList<>();
-        int tokenStart = 0;
-        for (int i = 0; i <= body.length(); i++) {
-            boolean atDelimiter = i == body.length() || body.charAt(i) == '|';
-            if (!atDelimiter) {
+        int bodyOffset = request.bodyOffset();
+        for (GwtRpcSemanticParser.ParameterInfo p : semantic.parameters()) {
+            int tokenIdx = p.valueTokenIndex();
+            if (tokenIdx < 0 || tokenIdx >= semantic.tokens().size()) {
                 continue;
             }
-            if (i > tokenStart) {
-                spans.add(new TokenSpan(body.substring(tokenStart, i), tokenStart, i));
-            }
-            tokenStart = i + 1;
+            GwtRpcSemanticParser.TokenSpan token = semantic.tokens().get(tokenIdx);
+            ranges.add(range(bodyOffset + token.start(), bodyOffset + token.end()));
         }
-        return spans;
+        return ranges;
     }
 
     private int detectAndRecordArtifacts(HttpRequest req, HttpRequestResponse message,
@@ -1066,6 +1325,7 @@ public class Extension implements BurpExtension, HttpHandler, PassiveScanCheck, 
         if (GwtDetector.looksLikeGwtRpcRequest(req)) {
             count += recordArtifactFromHistory(reqHost, reqPath, "GWT RPC Endpoint",
                     reqUrl, sourceLabel + " rpc request", req, message);
+            observeMethodInvocation(req, reqUrl, sourceLabel);
         }
         if (message != null && message.hasResponse()) {
             int responseSize = message.response().toByteArray().length();
@@ -1097,6 +1357,7 @@ public class Extension implements BurpExtension, HttpHandler, PassiveScanCheck, 
 
         HttpRequest request = artifact.sourceRequest;
         if (request != null) {
+            observeMethodInvocation(request, artifact.resolvedUrl, "analysis");
             appendGwtHeaders(acc.summary, request);
             appendGwtHeaders(acc.headers, request);
 
@@ -1265,8 +1526,11 @@ public class Extension implements BurpExtension, HttpHandler, PassiveScanCheck, 
         final JTextArea analysisSummaryArea;
         final JTextArea analysisHeadersArea;
         final JTextArea analysisRunsArea;
+        final JTextArea pentestArea;
         final DefaultTableModel methodsTableModel;
         final JTable methodsTable;
+        final DefaultTableModel methodMapTableModel;
+        final JTable methodMapTable;
         final JTabbedPane analysisTabs;
 
         DashboardPanel() {
@@ -1309,6 +1573,10 @@ public class Extension implements BurpExtension, HttpHandler, PassiveScanCheck, 
             analyzeSelectedButton.addActionListener(e -> analyzeSelectedArtifacts());
             JButton analyzeHistoryButton = new JButton("Analyze HTTP History");
             analyzeHistoryButton.addActionListener(e -> analyzeHttpHistory());
+            JButton queueIdorButton = new JButton("Queue IDOR -> Intruder");
+            queueIdorButton.addActionListener(e -> queueIdorFromSelection());
+            JButton replayMutationButton = new JButton("Replay Mutations");
+            replayMutationButton.addActionListener(e -> replayMutationsFromSelection());
             cancelHistoryButton = new JButton("Cancel History Analysis");
             cancelHistoryButton.setEnabled(false);
             cancelHistoryButton.addActionListener(e -> cancelHistoryFlag.set(true));
@@ -1338,6 +1606,8 @@ public class Extension implements BurpExtension, HttpHandler, PassiveScanCheck, 
             row2.add(exportMethodsButton);
             row2.add(analyzeSelectedButton);
             row2.add(analyzeHistoryButton);
+            row2.add(queueIdorButton);
+            row2.add(replayMutationButton);
 
             row3.add(new JLabel("Filter:"));
             row3.add(filterField);
@@ -1374,6 +1644,7 @@ public class Extension implements BurpExtension, HttpHandler, PassiveScanCheck, 
             analysisSummaryArea = createReadOnlyTextArea();
             analysisHeadersArea = createReadOnlyTextArea();
             analysisRunsArea = createReadOnlyTextArea();
+            pentestArea = createReadOnlyTextArea();
             methodsTableModel = new DefaultTableModel(new Object[]{"Method"}, 0) {
                 @Override
                 public boolean isCellEditable(int row, int column) {
@@ -1382,16 +1653,27 @@ public class Extension implements BurpExtension, HttpHandler, PassiveScanCheck, 
             };
             methodsTable = new JTable(methodsTableModel);
             methodsTable.setRowSorter(new TableRowSorter<>(methodsTableModel));
+            methodMapTableModel = new DefaultTableModel(new Object[]{"Method", "Hits", "Endpoints", "Sample Endpoint", "Sample Params"}, 0) {
+                @Override
+                public boolean isCellEditable(int row, int column) {
+                    return false;
+                }
+            };
+            methodMapTable = new JTable(methodMapTableModel);
+            methodMapTable.setRowSorter(new TableRowSorter<>(methodMapTableModel));
             analysisTabs = new JTabbedPane();
             analysisTabs.addTab("Summary", new JScrollPane(analysisSummaryArea));
             analysisTabs.addTab("Methods", new JScrollPane(methodsTable));
             analysisTabs.addTab("Headers", new JScrollPane(analysisHeadersArea));
+            analysisTabs.addTab("Method Map", new JScrollPane(methodMapTable));
+            analysisTabs.addTab("Pentest", new JScrollPane(pentestArea));
             analysisTabs.addTab("Runs", new JScrollPane(analysisRunsArea));
             requestPreviewEditor.setRequest(placeholderRequest("Select an artifact row to preview request."));
             responsePreviewEditor.setResponse(placeholderResponse("Select an artifact row to preview response."));
             String initMsg = "Click 'Analyze Selected Item(s)' to extract GWT methods/version/headers.";
             analysisSummaryArea.setText(initMsg);
             analysisHeadersArea.setText("");
+            pentestArea.setText("Use 'Queue IDOR -> Intruder' or 'Replay Mutations' to accelerate BAC and injection testing.\n");
             analysisRunsArea.insert("=== Initial State ===\n" + initMsg + "\n\n", 0);
 
             JPanel previews = new JPanel(new GridLayout(1, 3, 6, 6));
@@ -1422,22 +1704,92 @@ public class Extension implements BurpExtension, HttpHandler, PassiveScanCheck, 
         }
     }
 
+    private static final class MethodObservation {
+        private final AtomicInteger hits = new AtomicInteger();
+        private final AtomicInteger idCandidateCount = new AtomicInteger();
+        private final Set<String> endpoints = ConcurrentHashMap.newKeySet();
+        private volatile String sampleEndpoint = "";
+        private volatile String sampleParams = "";
+        private volatile String lastSource = "";
+
+        private void record(String endpoint,
+                            String source,
+                            List<GwtRpcSemanticParser.ParameterInfo> parameters,
+                            int idCandidates) {
+            hits.incrementAndGet();
+            idCandidateCount.addAndGet(Math.max(idCandidates, 0));
+            String ep = safe(endpoint);
+            if (!ep.isEmpty()) {
+                endpoints.add(ep);
+                sampleEndpoint = ep;
+            }
+            lastSource = safe(source);
+            if (!parameters.isEmpty()) {
+                List<String> values = new ArrayList<>();
+                for (GwtRpcSemanticParser.ParameterInfo p : parameters) {
+                    if (values.size() >= 3) {
+                        break;
+                    }
+                    String resolved = safe(p.valueResolved()).trim();
+                    if (!resolved.isEmpty()) {
+                        values.add(truncate(resolved, 30));
+                    }
+                }
+                if (!values.isEmpty()) {
+                    sampleParams = String.join(", ", values);
+                }
+            }
+        }
+
+        private MethodObservationSnapshot snapshot() {
+            String params = sampleParams;
+            if (idCandidateCount.get() > 0) {
+                params = (params.isEmpty() ? "" : params + " | ") + "ID-like params seen: " + idCandidateCount.get() + " (" + lastSource + ")";
+            }
+            return new MethodObservationSnapshot(
+                    hits.get(),
+                    endpoints.size(),
+                    sampleEndpoint,
+                    params
+            );
+        }
+    }
+
+    private static final class MethodRiskState {
+        private final AtomicInteger idCandidateHits = new AtomicInteger();
+        private final AtomicInteger injectionCandidateHits = new AtomicInteger();
+        private final Set<String> authContexts = ConcurrentHashMap.newKeySet();
+
+        private void record(int idCount, int injectionCount, String authContext) {
+            if (idCount > 0) {
+                idCandidateHits.addAndGet(idCount);
+            }
+            if (injectionCount > 0) {
+                injectionCandidateHits.addAndGet(injectionCount);
+            }
+            String fp = safe(authContext).trim();
+            if (!fp.isEmpty()) {
+                authContexts.add(fp);
+            }
+        }
+
+        private int authContextCount() {
+            return authContexts.size();
+        }
+    }
+
+    private record MethodObservationSnapshot(
+            int hits,
+            int endpointCount,
+            String sampleEndpoint,
+            String sampleParams
+    ) {
+    }
+
     private static final class AnalysisAccumulator {
         private final StringBuilder summary = new StringBuilder();
         private final Set<String> methods = new LinkedHashSet<>();
         private final StringBuilder headers = new StringBuilder();
-    }
-
-    private static final class TokenSpan {
-        private final String text;
-        private final int start;
-        private final int end;
-
-        private TokenSpan(String text, int start, int end) {
-            this.text = text;
-            this.start = start;
-            this.end = end;
-        }
     }
 
     private static final class RpcTableModel extends DefaultTableModel {
