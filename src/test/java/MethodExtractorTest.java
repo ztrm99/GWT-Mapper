@@ -131,6 +131,25 @@ class MethodExtractorTest {
     }
 
     @Test
+    void extractMethodHintsFindsQuotedInterfaceMethodPairs() {
+        String body = "rpc('com.example.InventoryService','listItems')";
+        Set<String> hints = MethodExtractor.extractMethodHints(body);
+        assertTrue(hints.contains("com.example.InventoryService::listItems"));
+    }
+
+    @Test
+    void extractMethodHintsFindsQuotedMethodInterfacePairs() {
+        String body = "rpc('saveOrder','com.example.OrderService')";
+        Set<String> hints = MethodExtractor.extractMethodHints(body);
+        assertTrue(hints.contains("com.example.OrderService::saveOrder"));
+    }
+
+    @Test
+    void extractMethodHintsReturnsEmptyForNullInput() {
+        assertTrue(MethodExtractor.extractMethodHints(null).isEmpty());
+    }
+
+    @Test
     void extractMethodHintsRespectsMethodCap() {
         StringBuilder body = new StringBuilder();
         for (int i = 0; i < 25; i++) {

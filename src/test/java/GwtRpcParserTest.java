@@ -46,4 +46,24 @@ class GwtRpcParserTest {
         assertEquals("OK", rows.get(0).resolved());
         assertTrue(rows.stream().anyMatch(r -> r.field().startsWith("Payload[") && r.raw().contains("done")));
     }
+
+    @Test
+    void parseRequestPreservesEmptyTokensInsideStringTable() {
+        String body = "7|0|4|http://target/app/||com.test.Service|doThing|1|2|3|4|";
+        List<GwtRpcParser.RpcRow> rows = GwtRpcParser.parseRequest(body);
+
+        assertTrue(rows.stream().anyMatch(r -> r.field().equals("StringTable[2]") && r.raw().isEmpty()));
+        assertTrue(rows.stream().anyMatch(r -> r.field().equals("Service Interface Ref") && r.resolved().equals("com.test.Service")));
+        assertTrue(rows.stream().anyMatch(r -> r.field().equals("Method Ref") && r.resolved().equals("doThing")));
+    }
+
+    @Test
+    void parseRequestIgnoresTerminalDelimiterOnly() {
+        String body = "7|0|2|module|policy|1|2|";
+        List<GwtRpcParser.RpcRow> rows = GwtRpcParser.parseRequest(body);
+
+        assertEquals("String Table Count", rows.get(2).field());
+        assertTrue(rows.stream().anyMatch(r -> r.field().equals("Module Base URL Ref") && r.resolved().equals("module")));
+        assertTrue(rows.stream().noneMatch(r -> r.field().equals("Payload Token") && r.raw().isEmpty()));
+    }
 }

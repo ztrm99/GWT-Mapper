@@ -179,11 +179,14 @@ public final class GwtRpcParser {
             return Collections.emptyList();
         }
         String[] arr = normalized.split("\\|", -1);
-        List<String> out = new ArrayList<>();
-        for (String token : arr) {
-            if (!token.isEmpty()) {
-                out.add(token);
-            }
+        int limit = arr.length;
+        // A trailing pipe is a delimiter terminator in GWT payloads, not a real token.
+        if (normalized.endsWith("|") && limit > 0) {
+            limit--;
+        }
+        List<String> out = new ArrayList<>(Math.max(limit, 0));
+        for (int i = 0; i < limit; i++) {
+            out.add(arr[i]);
         }
         return out;
     }

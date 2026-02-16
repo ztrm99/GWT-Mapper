@@ -78,6 +78,7 @@ import static burp.api.montoya.http.message.responses.HttpResponse.httpResponse;
 
 public class Extension implements BurpExtension, HttpHandler, PassiveScanCheck, HttpRequestEditorProvider, HttpResponseEditorProvider, ContextMenuItemsProvider {
     private static final String ISSUE_NAME = "GWT RPC technology identified";
+    private static final AuditIssueSeverity ISSUE_SEVERITY = AuditIssueSeverity.INFORMATION;
     private static final String SETTING_OUTPUT_DIR = "output_dir";
     private static final String SETTING_PASSIVE_SCAN_ENABLED = "passive_scan_enabled";
     private static final String SETTING_SCOPE_ONLY_HISTORY = "scope_only_history";
@@ -92,6 +93,7 @@ public class Extension implements BurpExtension, HttpHandler, PassiveScanCheck, 
     private GwtDownloader downloader;
     private ExecutorService passiveExecutor;
     private ExecutorService historyExecutor;
+    private ExecutorService downloadExecutor;
     private volatile Future<?> historyFuture;
 
     private JPanel mainPanel;
@@ -121,6 +123,11 @@ public class Extension implements BurpExtension, HttpHandler, PassiveScanCheck, 
         });
         this.historyExecutor = Executors.newSingleThreadExecutor(r -> {
             Thread t = new Thread(r, "gwt-history-analysis");
+            t.setDaemon(true);
+            return t;
+        });
+        this.downloadExecutor = Executors.newSingleThreadExecutor(r -> {
+            Thread t = new Thread(r, "gwt-download-worker");
             t.setDaemon(true);
             return t;
         });
@@ -199,11 +206,11 @@ public class Extension implements BurpExtension, HttpHandler, PassiveScanCheck, 
                 detail.toString(),
                 null,
                 req.url(),
-                AuditIssueSeverity.INFORMATION,
+                ISSUE_SEVERITY,
                 AuditIssueConfidence.CERTAIN,
                 "GWT RPC attack surface",
                 "The application appears to use Google Web Toolkit (GWT) RPC endpoints or artifacts that can be mapped for controlled penetration testing.",
-                AuditIssueSeverity.INFORMATION,
+                ISSUE_SEVERITY,
                 requestResponse
         );
 
@@ -499,6 +506,7 @@ public class Extension implements BurpExtension, HttpHandler, PassiveScanCheck, 
             return;
         }
 
+        List<GwtArtifact> targets = new ArrayList<>();
         for (int selectedRow : rows) {
             int row = dashboard.artifactsTable.convertRowIndexToModel(selectedRow);
             String host = String.valueOf(dashboard.artifactsModel.getValueAt(row, 0));
@@ -506,15 +514,34 @@ public class Extension implements BurpExtension, HttpHandler, PassiveScanCheck, 
             String type = String.valueOf(dashboard.artifactsModel.getValueAt(row, 2));
             GwtArtifact artifact = artifactStore.find(host, path, type);
             if (artifact != null) {
-                downloader.downloadArtifact(artifact, resolveOutputRoot(), this::info, msg -> api.logging().logToError("[GWT Mapper] " + msg));
+                targets.add(artifact);
             }
         }
+        if (targets.isEmpty()) {
+            info("No downloadable artifacts found for selected rows.");
+            return;
+        }
+
+        Path outputRoot = resolveOutputRoot();
+        downloadExecutor.submit(() -> {
+            for (GwtArtifact artifact : targets) {
+                downloader.downloadArtifact(artifact, outputRoot, this::info, msg -> api.logging().logToError("[GWT Mapper] " + msg));
+            }
+        });
     }
 
     private void downloadAll() {
-        for (GwtArtifact artifact : artifactStore.all()) {
-            downloader.downloadArtifact(artifact, resolveOutputRoot(), this::info, msg -> api.logging().logToError("[GWT Mapper] " + msg));
+        List<GwtArtifact> all = artifactStore.all();
+        if (all.isEmpty()) {
+            info("No artifacts available to download.");
+            return;
         }
+        Path outputRoot = resolveOutputRoot();
+        downloadExecutor.submit(() -> {
+            for (GwtArtifact artifact : all) {
+                downloader.downloadArtifact(artifact, outputRoot, this::info, msg -> api.logging().logToError("[GWT Mapper] " + msg));
+            }
+        });
     }
 
     private Path resolveOutputRoot() {
@@ -818,6 +845,7 @@ public class Extension implements BurpExtension, HttpHandler, PassiveScanCheck, 
             return;
         }
 
+        final boolean scopeOnly = dashboard.scopeOnlyHistoryCheckBox.isSelected();
         cancelHistoryFlag.set(false);
         dashboard.cancelHistoryButton.setEnabled(true);
         dashboard.historyProgressLabel.setText("Running...");
@@ -836,7 +864,7 @@ public class Extension implements BurpExtension, HttpHandler, PassiveScanCheck, 
                     }
 
                     HttpRequest req = item.request();
-                    if (dashboard.scopeOnlyHistoryCheckBox.isSelected() && !req.isInScope()) {
+                    if (!AnalysisPolicy.shouldProcessHistoryItem(scopeOnly, req.isInScope())) {
                         continue;
                     }
 
@@ -847,7 +875,7 @@ public class Extension implements BurpExtension, HttpHandler, PassiveScanCheck, 
                     String reqPath = req.pathWithoutQuery();
                     String reqUrl = req.url();
                     String reqHost = req.httpService().host();
-                    int added = detectAndRecordArtifacts(req, message, "history");
+                    int added = detectAndRecordArtifacts(req, message, "history", passiveMaxBodyBytes);
                     boolean rowMatched = added > 0;
                     artifactsAdded += added;
                     if (rowMatched) {
@@ -909,7 +937,7 @@ public class Extension implements BurpExtension, HttpHandler, PassiveScanCheck, 
             String reqUrl = req.url();
             String reqHost = req.httpService().host();
 
-            int found = detectAndRecordArtifacts(req, rr, "context");
+            int found = detectAndRecordArtifacts(req, rr, "context", passiveMaxBodyBytes);
             added += found;
             boolean matched = found > 0;
 
@@ -1025,7 +1053,8 @@ public class Extension implements BurpExtension, HttpHandler, PassiveScanCheck, 
     }
 
     private int detectAndRecordArtifacts(HttpRequest req, HttpRequestResponse message,
-                                         String sourceLabel) {
+                                         String sourceLabel,
+                                         int responseBodyLimitBytes) {
         int count = 0;
         String reqPath = req.pathWithoutQuery();
         String reqUrl = req.url();
@@ -1039,12 +1068,17 @@ public class Extension implements BurpExtension, HttpHandler, PassiveScanCheck, 
                     reqUrl, sourceLabel + " rpc request", req, message);
         }
         if (message != null && message.hasResponse()) {
-            String body = safe(message.response().bodyToString());
-            for (String found : GwtDetector.extractArtifactPaths(body)) {
-                String resolved = GwtDetector.resolvePath(reqUrl, found);
-                count += recordArtifactFromHistory(GwtDetector.hostFromUrl(reqUrl), found,
-                        GwtDetector.classifyArtifact(found), resolved,
-                        sourceLabel + " response body", req, message);
+            int responseSize = message.response().toByteArray().length();
+            if (AnalysisPolicy.shouldExtractResponseArtifacts(responseSize, responseBodyLimitBytes)) {
+                String body = safe(message.response().bodyToString());
+                for (String found : GwtDetector.extractArtifactPaths(body)) {
+                    String resolved = GwtDetector.resolvePath(reqUrl, found);
+                    count += recordArtifactFromHistory(GwtDetector.hostFromUrl(reqUrl), found,
+                            GwtDetector.classifyArtifact(found), resolved,
+                            sourceLabel + " response body", req, message);
+                }
+            } else {
+                api.logging().logToOutput("[GWT Mapper] Skipping response artifact extraction for oversized response (" + responseSize + " bytes): " + reqUrl);
             }
         }
         return count;

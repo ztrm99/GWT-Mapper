@@ -20,6 +20,9 @@ public final class MethodExtractor {
     private static final Pattern LITERAL_INVOKE_PAT = Pattern.compile("\\b([A-Za-z0-9_$]+)\\([^;]*'com\\.[^']+'\\s*,\\s*\\d+\\s*\\)");
     private static final Pattern RPC_STYLE_PAT = Pattern.compile("([A-Za-z0-9_$.]+)::([A-Za-z0-9_]+)\\(");
     private static final Pattern JS_CALLS_PAT = Pattern.compile("\\.([A-Za-z_][A-Za-z0-9_]{2,})\\(");
+    private static final Pattern IFACE_METHOD_LITERAL_PAT = Pattern.compile("['\"]((?:com|org|net)\\.[A-Za-z0-9_$.]+)['\"]\\s*,\\s*['\"]([A-Za-z_][A-Za-z0-9_$]{1,})['\"]");
+    private static final Pattern METHOD_IFACE_LITERAL_PAT = Pattern.compile("['\"]([A-Za-z_][A-Za-z0-9_$]{1,})['\"]\\s*,\\s*['\"]((?:com|org|net)\\.[A-Za-z0-9_$.]+)['\"]");
+    private static final Pattern SERVICE_METHOD_PAIR_PAT = Pattern.compile("((?:com|org|net)\\.[A-Za-z0-9_$.]+)[^\\n]{0,140}::([A-Za-z0-9_]+)");
     private static final Pattern GWT_VERSION_1 = Pattern.compile("gwtVersion\\s*[:=]\\s*[\"']([^\"']+)[\"']", Pattern.CASE_INSENSITIVE);
     private static final Pattern GWT_VERSION_2 = Pattern.compile("GWT_VERSION\\s*[:=]\\s*[\"']([^\"']+)[\"']", Pattern.CASE_INSENSITIVE);
     private static final Pattern GWT_VERSION_3 = Pattern.compile("Google Web Toolkit\\s*([0-9]+(?:\\.[0-9]+)+)", Pattern.CASE_INSENSITIVE);
@@ -179,20 +182,44 @@ public final class MethodExtractor {
 
     public static Set<String> extractMethodHints(String body) {
         Set<String> methods = new LinkedHashSet<>();
-        Matcher rpcStyle = RPC_STYLE_PAT.matcher(body);
-        while (rpcStyle.find() && methods.size() < 20) {
-            methods.add(rpcStyle.group(1) + "::" + rpcStyle.group(2));
+        String source = safe(body);
+        if (source.isEmpty()) {
+            return methods;
         }
-        Matcher jsCalls = JS_CALLS_PAT.matcher(body);
+
+        Matcher rpcStyle = RPC_STYLE_PAT.matcher(source);
+        while (rpcStyle.find() && methods.size() < 20) {
+            addMethod(methods, rpcStyle.group(1), rpcStyle.group(2));
+        }
+        Matcher quotedIfaceMethod = IFACE_METHOD_LITERAL_PAT.matcher(source);
+        while (quotedIfaceMethod.find() && methods.size() < 20) {
+            addMethod(methods, quotedIfaceMethod.group(1), quotedIfaceMethod.group(2));
+        }
+        Matcher quotedMethodIface = METHOD_IFACE_LITERAL_PAT.matcher(source);
+        while (quotedMethodIface.find() && methods.size() < 20) {
+            addMethod(methods, quotedMethodIface.group(2), quotedMethodIface.group(1));
+        }
+        Matcher serviceMethodPairs = SERVICE_METHOD_PAIR_PAT.matcher(source);
+        while (serviceMethodPairs.find() && methods.size() < 20) {
+            addMethod(methods, serviceMethodPairs.group(1), serviceMethodPairs.group(2));
+        }
+        Matcher jsCalls = JS_CALLS_PAT.matcher(source);
         while (jsCalls.find() && methods.size() < 20) {
-            methods.add(jsCalls.group(1));
+            String method = jsCalls.group(1);
+            if (isLikelyMethodName(method)) {
+                methods.add(method);
+            }
         }
         return methods;
     }
 
     public static String extractGwtVersion(String body) {
+        String source = safe(body);
+        if (source.isEmpty()) {
+            return "";
+        }
         for (Pattern p : GWT_VERSION_PATTERNS) {
-            Matcher m = p.matcher(body);
+            Matcher m = p.matcher(source);
             if (m.find()) {
                 return m.group(1);
             }
@@ -226,5 +253,32 @@ public final class MethodExtractor {
 
     private static String safe(String s) {
         return s == null ? "" : s;
+    }
+
+    private static void addMethod(Set<String> out, String iface, String method) {
+        String normalizedIface = safe(iface).trim();
+        String normalizedMethod = safe(method).trim();
+        if (!isLikelyMethodName(normalizedMethod)) {
+            return;
+        }
+        if (normalizedIface.startsWith("com.") || normalizedIface.startsWith("org.") || normalizedIface.startsWith("net.")) {
+            out.add(normalizedIface + "::" + normalizedMethod);
+        } else {
+            out.add(normalizedMethod);
+        }
+    }
+
+    private static boolean isLikelyMethodName(String method) {
+        if (method.isEmpty() || method.length() < 2) {
+            return false;
+        }
+        String lower = method.toLowerCase();
+        return !lower.equals("call")
+                && !lower.equals("apply")
+                && !lower.equals("bind")
+                && !lower.equals("push")
+                && !lower.equals("pop")
+                && !lower.equals("slice")
+                && !lower.equals("splice");
     }
 }
