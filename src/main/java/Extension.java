@@ -6,6 +6,8 @@ import burp.api.montoya.http.handler.HttpResponseReceived;
 import burp.api.montoya.http.handler.RequestToBeSentAction;
 import burp.api.montoya.http.handler.ResponseReceivedAction;
 import burp.api.montoya.intruder.HttpRequestTemplate;
+import burp.api.montoya.core.Annotations;
+import burp.api.montoya.core.HighlightColor;
 import burp.api.montoya.http.message.HttpRequestResponse;
 import burp.api.montoya.http.message.requests.HttpRequest;
 import burp.api.montoya.http.message.responses.HttpResponse;
@@ -44,6 +46,7 @@ import javax.swing.JTabbedPane;
 import javax.swing.JTable;
 import javax.swing.JTextArea;
 import javax.swing.JTextField;
+import javax.swing.JComboBox;
 import javax.swing.RowFilter;
 import javax.swing.SwingUtilities;
 import javax.swing.table.DefaultTableModel;
@@ -88,6 +91,8 @@ public class Extension implements BurpExtension, HttpHandler, PassiveScanCheck, 
     private static final String SETTING_SCOPE_ONLY_HISTORY = "scope_only_history";
     private static final String SETTING_PASSIVE_MAX_BODY_BYTES = "passive_max_body_bytes";
     private static final String SETTING_FAST_ANALYZE = "fast_analyze";
+    private static final String SETTING_HISTORY_ANNOTATIONS_ENABLED = "history_annotations_enabled";
+    private static final String SETTING_HISTORY_HIGHLIGHT_COLOR = "history_highlight_color";
     private static final int PREVIEW_MAX_BYTES = 250_000;
     private static final int DEFAULT_PASSIVE_MAX_BODY_BYTES = 300_000;
 
@@ -113,6 +118,7 @@ public class Extension implements BurpExtension, HttpHandler, PassiveScanCheck, 
     private JTabbedPane workTabs;
     private int analysisRunCounter = 0;
     private int passiveMaxBodyBytes;
+    private HighlightColor historyHighlightColor;
     private Path defaultOutputDir;
 
     @Override
@@ -121,6 +127,7 @@ public class Extension implements BurpExtension, HttpHandler, PassiveScanCheck, 
         this.extensionData = montoyaApi.persistence().extensionData();
         this.defaultOutputDir = Paths.get(System.getProperty("user.home"), ".gwt-scanner");
         this.passiveMaxBodyBytes = loadPassiveMaxBodyBytes();
+        this.historyHighlightColor = loadHistoryHighlightColor();
         this.artifactStore = new ArtifactStore();
         this.downloader = new GwtDownloader(montoyaApi);
         this.passiveExecutor = Executors.newSingleThreadExecutor(r -> {
@@ -256,6 +263,7 @@ public class Extension implements BurpExtension, HttpHandler, PassiveScanCheck, 
         }
 
         String reqPath = requestToBeSent.pathWithoutQuery();
+        boolean looksLikeRpc = GwtDetector.looksLikeGwtRpcRequest(requestToBeSent);
         HttpRequest reqCopy = requestToBeSent.copyToTempFile();
         passiveExecutor.submit(() -> {
             if (GwtDetector.isPotentialGwtPath(reqPath)) {
@@ -263,13 +271,13 @@ public class Extension implements BurpExtension, HttpHandler, PassiveScanCheck, 
                 recordArtifact(reqCopy.httpService().host(), reqPath, type, reqCopy.url(), "request path", reqCopy, null);
             }
 
-            if (GwtDetector.looksLikeGwtRpcRequest(reqCopy)) {
+            if (looksLikeRpc) {
                 recordArtifact(reqCopy.httpService().host(), reqPath, "GWT RPC Endpoint", reqCopy.url(), "rpc request", reqCopy, null);
                 observeMethodInvocation(reqCopy, reqCopy.url(), "http-handler");
             }
         });
 
-        return RequestToBeSentAction.continueWith(requestToBeSent);
+        return RequestToBeSentAction.continueWith(requestToBeSent, annotateTraffic(requestToBeSent.annotations(), reqPath, looksLikeRpc));
     }
 
     @Override
@@ -294,12 +302,14 @@ public class Extension implements BurpExtension, HttpHandler, PassiveScanCheck, 
             });
         }
 
-        return ResponseReceivedAction.continueWith(responseReceived);
+        boolean looksLikeRpc = GwtDetector.looksLikeGwtRpcRequest(sourceRequest);
+        Annotations annotations = annotateTraffic(responseReceived.annotations(), sourceRequest.pathWithoutQuery(), looksLikeRpc);
+        return ResponseReceivedAction.continueWith(responseReceived, annotations);
     }
 
     @Override
     public ExtensionProvidedHttpRequestEditor provideHttpRequestEditor(EditorCreationContext creationContext) {
-        return new GwtRequestEditor();
+        return new GwtRequestEditor(creationContext);
     }
 
     @Override
@@ -394,6 +404,9 @@ public class Extension implements BurpExtension, HttpHandler, PassiveScanCheck, 
         extensionData.setBoolean(SETTING_SCOPE_ONLY_HISTORY, dashboard.scopeOnlyHistoryCheckBox.isSelected());
         extensionData.setBoolean(SETTING_FAST_ANALYZE, dashboard.fastAnalyzeCheckBox.isSelected());
         extensionData.setInteger(SETTING_PASSIVE_MAX_BODY_BYTES, passiveMaxBodyBytes);
+        extensionData.setBoolean(SETTING_HISTORY_ANNOTATIONS_ENABLED, dashboard.historyAnnotationsCheckBox.isSelected());
+        historyHighlightColor = selectedHistoryHighlightColorFromUi();
+        extensionData.setString(SETTING_HISTORY_HIGHLIGHT_COLOR, historyHighlightColor.name());
         info("Settings saved.");
     }
 
@@ -426,6 +439,52 @@ public class Extension implements BurpExtension, HttpHandler, PassiveScanCheck, 
             return DEFAULT_PASSIVE_MAX_BODY_BYTES;
         }
         return persisted;
+    }
+
+    private boolean loadHistoryAnnotationsEnabled() {
+        Boolean persisted = extensionData.getBoolean(SETTING_HISTORY_ANNOTATIONS_ENABLED);
+        return persisted == null || persisted;
+    }
+
+    private HighlightColor loadHistoryHighlightColor() {
+        String persisted = extensionData.getString(SETTING_HISTORY_HIGHLIGHT_COLOR);
+        if (persisted == null || persisted.isBlank()) {
+            return HighlightColor.YELLOW;
+        }
+        try {
+            return HighlightColor.valueOf(persisted.trim());
+        } catch (Exception ex) {
+            return HighlightColor.YELLOW;
+        }
+    }
+
+    private HighlightColor selectedHistoryHighlightColorFromUi() {
+        if (dashboard == null || dashboard.historyHighlightColorCombo == null) {
+            return historyHighlightColor == null ? HighlightColor.YELLOW : historyHighlightColor;
+        }
+        String selected = safe((String) dashboard.historyHighlightColorCombo.getSelectedItem()).trim();
+        if (selected.isEmpty()) {
+            return HighlightColor.YELLOW;
+        }
+        try {
+            return HighlightColor.valueOf(selected);
+        } catch (Exception ex) {
+            return HighlightColor.YELLOW;
+        }
+    }
+
+    private Annotations annotateTraffic(Annotations existing, String reqPath, boolean looksLikeRpcRequest) {
+        if (dashboard != null && !dashboard.historyAnnotationsCheckBox.isSelected()) {
+            return existing;
+        }
+        String note = GwtHistoryAnnotationPolicy.detectNote(reqPath, looksLikeRpcRequest);
+        if (note.isEmpty()) {
+            return existing;
+        }
+        HighlightColor color = selectedHistoryHighlightColorFromUi();
+        Annotations base = existing == null ? Annotations.annotations() : existing;
+        String mergedNote = GwtHistoryAnnotationPolicy.mergeNote(base.notes(), note);
+        return base.withNotes(mergedNote).withHighlightColor(color);
     }
 
     private boolean isPassiveScanEnabled() {
@@ -1177,15 +1236,19 @@ public class Extension implements BurpExtension, HttpHandler, PassiveScanCheck, 
     }
 
     private HttpRequest replaceRequestBody(HttpRequest request, String body) {
-        byte[] raw = request.toByteArray().getBytes();
-        int bodyOffset = request.bodyOffset();
-        if (bodyOffset < 0 || bodyOffset > raw.length) {
+        try {
+            // Keep method/path/version/headers exactly as Burp tracks them and only replace body bytes.
+            HttpRequest updated = request.withBody(safe(body));
+            // Preserve explicit Content-Length when present in HTTP/1 requests.
+            if (updated.hasHeader("Content-Length")) {
+                int len = safe(body).getBytes(StandardCharsets.ISO_8859_1).length;
+                updated = updated.withUpdatedHeader("Content-Length", String.valueOf(len));
+            }
+            return updated;
+        } catch (Exception ex) {
+            api.logging().logToError("[GWT Mapper] Failed to replace request body: " + ex.getMessage());
             return request;
         }
-        String full = new String(raw, StandardCharsets.ISO_8859_1);
-        String head = full.substring(0, bodyOffset);
-        String updatedHead = head.replaceAll("(?im)^Content-Length:\\s*\\d+\\s*$", "Content-Length: " + body.getBytes(StandardCharsets.ISO_8859_1).length);
-        return httpRequest(updatedHead + body);
     }
 
     private void observeMethodInvocation(HttpRequest req, String sourceUrl, String sourceLabel) {
@@ -1519,6 +1582,8 @@ public class Extension implements BurpExtension, HttpHandler, PassiveScanCheck, 
         final JCheckBox passiveScanCheckBox;
         final JCheckBox scopeOnlyHistoryCheckBox;
         final JCheckBox fastAnalyzeCheckBox;
+        final JCheckBox historyAnnotationsCheckBox;
+        final JComboBox<String> historyHighlightColorCombo;
         final JButton cancelHistoryButton;
         final JLabel historyProgressLabel;
         final HttpRequestEditor requestPreviewEditor;
@@ -1588,6 +1653,22 @@ public class Extension implements BurpExtension, HttpHandler, PassiveScanCheck, 
             scopeOnlyHistoryCheckBox.addActionListener(e -> persistSettings());
             fastAnalyzeCheckBox = new JCheckBox("Fast Analyze (skip cache fetch)", loadFastAnalyze());
             fastAnalyzeCheckBox.addActionListener(e -> persistSettings());
+            historyAnnotationsCheckBox = new JCheckBox("Annotate HTTP History", loadHistoryAnnotationsEnabled());
+            historyAnnotationsCheckBox.addActionListener(e -> persistSettings());
+            historyHighlightColorCombo = new JComboBox<>(new String[]{
+                    HighlightColor.YELLOW.name(),
+                    HighlightColor.ORANGE.name(),
+                    HighlightColor.CYAN.name(),
+                    HighlightColor.GREEN.name(),
+                    HighlightColor.MAGENTA.name(),
+                    HighlightColor.PINK.name(),
+                    HighlightColor.BLUE.name(),
+                    HighlightColor.GRAY.name(),
+                    HighlightColor.RED.name(),
+                    HighlightColor.NONE.name()
+            });
+            historyHighlightColorCombo.setSelectedItem(historyHighlightColor.name());
+            historyHighlightColorCombo.addActionListener(e -> persistSettings());
             historyProgressLabel = new JLabel("Idle");
 
             row1.add(new JLabel("Download Folder:"));
@@ -1614,6 +1695,9 @@ public class Extension implements BurpExtension, HttpHandler, PassiveScanCheck, 
             row3.add(applyFilterButton);
             row3.add(scopeOnlyHistoryCheckBox);
             row3.add(fastAnalyzeCheckBox);
+            row3.add(historyAnnotationsCheckBox);
+            row3.add(new JLabel("Highlight:"));
+            row3.add(historyHighlightColorCombo);
             row3.add(cancelHistoryButton);
             row3.add(historyProgressLabel);
 
@@ -1793,13 +1877,16 @@ public class Extension implements BurpExtension, HttpHandler, PassiveScanCheck, 
     }
 
     private static final class RpcTableModel extends DefaultTableModel {
-        private RpcTableModel() {
+        private final boolean editableRawColumn;
+
+        private RpcTableModel(boolean editableRawColumn) {
             super(new Object[]{"Index", "Field", "Raw", "Resolved"}, 0);
+            this.editableRawColumn = editableRawColumn;
         }
 
         @Override
         public boolean isCellEditable(int row, int column) {
-            return false;
+            return editableRawColumn && column == 2;
         }
 
         private void setRows(List<GwtRpcParser.RpcRow> rows) {
@@ -1808,32 +1895,113 @@ public class Extension implements BurpExtension, HttpHandler, PassiveScanCheck, 
                 addRow(new Object[]{row.index(), row.field(), row.raw(), row.resolved()});
             }
         }
+
+        private List<GwtRpcParser.RpcRow> snapshotRows() {
+            List<GwtRpcParser.RpcRow> rows = new ArrayList<>(getRowCount());
+            for (int i = 0; i < getRowCount(); i++) {
+                rows.add(new GwtRpcParser.RpcRow(
+                        safe(getValueAt(i, 0)),
+                        safe(getValueAt(i, 1)),
+                        safe(getValueAt(i, 2)),
+                        safe(getValueAt(i, 3))
+                ));
+            }
+            return rows;
+        }
+
+        private static String safe(Object value) {
+            return value == null ? "" : value.toString();
+        }
     }
 
     private final class GwtRequestEditor implements ExtensionProvidedHttpRequestEditor {
         private final JPanel panel;
         private final RpcTableModel model;
+        private final JTable table;
+        private final JButton applyButton;
+        private final JLabel statusLabel;
+        private final boolean applySupported;
         private HttpRequestResponse current;
+        private HttpRequest editedRequest;
+        private List<String> originalTokens = Collections.emptyList();
+        private boolean trailingDelimiter;
+        private boolean hasPendingEdits;
+        private boolean loadingRows;
 
-        private GwtRequestEditor() {
+        private GwtRequestEditor(EditorCreationContext creationContext) {
             panel = new JPanel(new BorderLayout());
-            model = new RpcTableModel();
-            panel.add(new JScrollPane(new JTable(model)), BorderLayout.CENTER);
+            applySupported = GwtRpcRequestEditSupport.isApplySupported(creationContext);
+            model = new RpcTableModel(applySupported);
+            table = new JTable(model);
+            applyButton = new JButton("Apply Table Edits to Request");
+            applyButton.setEnabled(false);
+            applyButton.addActionListener(e -> applyEditsToRequest());
+            statusLabel = new JLabel(applySupported
+                    ? "Edit the 'Raw' column and click Apply to update the request."
+                    : "Request editing is available in Proxy/Repeater/Intruder editable editors.");
+
+            JPanel controls = new JPanel(new FlowLayout(FlowLayout.LEFT));
+            controls.add(applyButton);
+            controls.add(statusLabel);
+            panel.add(controls, BorderLayout.NORTH);
+            panel.add(new JScrollPane(table), BorderLayout.CENTER);
+
+            model.addTableModelListener(e -> {
+                if (!applySupported || loadingRows || e.getFirstRow() < 0) {
+                    return;
+                }
+                if (e.getColumn() == 2 || e.getColumn() == -1) {
+                    hasPendingEdits = true;
+                    editedRequest = null;
+                    statusLabel.setText("Pending table edits. Click Apply to update the request.");
+                    updateApplyButtonState();
+                }
+            });
         }
 
         @Override
         public HttpRequest getRequest() {
+            if (editedRequest != null) {
+                return editedRequest;
+            }
             return current == null ? null : current.request();
         }
 
         @Override
         public void setRequestResponse(HttpRequestResponse requestResponse) {
             current = requestResponse;
+            editedRequest = null;
+            hasPendingEdits = false;
+            originalTokens = Collections.emptyList();
+            trailingDelimiter = false;
+            loadingRows = true;
             if (requestResponse == null) {
                 model.setRows(Collections.emptyList());
+                statusLabel.setText("No request selected.");
+                loadingRows = false;
+                updateApplyButtonState();
                 return;
             }
-            model.setRows(GwtRpcParser.parseRequest(requestResponse.request().bodyToString()));
+            String body = safe(requestResponse.request().bodyToString());
+            model.setRows(GwtRpcParser.parseRequest(body));
+            Optional<GwtRpcSemanticParser.SemanticRequest> parsed = GwtRpcSemanticParser.parseRequest(body);
+            if (parsed.isPresent()) {
+                List<String> tokens = new ArrayList<>(parsed.get().tokens().size());
+                for (GwtRpcSemanticParser.TokenSpan token : parsed.get().tokens()) {
+                    tokens.add(token.text());
+                }
+                originalTokens = tokens;
+                trailingDelimiter = parsed.get().trailingDelimiter();
+                if (applySupported) {
+                    statusLabel.setText("Edit the 'Raw' column and click Apply to update the request.");
+                }
+            } else {
+                if (applySupported) {
+                    statusLabel.setText("Request body could not be parsed as GWT-RPC.");
+                }
+            }
+            loadingRows = false;
+            updateApplyButtonState();
         }
 
         @Override
@@ -1858,7 +2026,30 @@ public class Extension implements BurpExtension, HttpHandler, PassiveScanCheck, 
 
         @Override
         public boolean isModified() {
-            return false;
+            return editedRequest != null && current != null
+                    && !safe(current.request().bodyToString()).equals(safe(editedRequest.bodyToString()));
+        }
+
+        private void applyEditsToRequest() {
+            if (!applySupported || current == null || originalTokens.isEmpty()) {
+                return;
+            }
+            if (table.isEditing() && table.getCellEditor() != null) {
+                table.getCellEditor().stopCellEditing();
+            }
+            String rebuiltBody = GwtRpcRequestEditSupport.rebuildBodyFromRows(
+                    model.snapshotRows(),
+                    originalTokens,
+                    trailingDelimiter
+            );
+            editedRequest = replaceRequestBody(current.request(), rebuiltBody);
+            hasPendingEdits = false;
+            statusLabel.setText("Applied table edits to request body.");
+            updateApplyButtonState();
+        }
+
+        private void updateApplyButtonState() {
+            applyButton.setEnabled(applySupported && current != null && !originalTokens.isEmpty() && hasPendingEdits);
         }
     }
 
@@ -1869,7 +2060,7 @@ public class Extension implements BurpExtension, HttpHandler, PassiveScanCheck, 
 
         private GwtResponseEditor() {
             panel = new JPanel(new BorderLayout());
-            model = new RpcTableModel();
+            model = new RpcTableModel(false);
             panel.add(new JScrollPane(new JTable(model)), BorderLayout.CENTER);
         }
 
