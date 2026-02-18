@@ -85,6 +85,46 @@ All production sources are in `src/main/java` (default package).
   - validation commands run (for example `.\gradlew.bat test`)
   - screenshots/notes for Burp UI changes
 
+## Release & Deployment (GitHub Tags)
+
+Use SemVer tags for releases, for example `v0.1.0`, `v0.1.1`, `v0.2.0`.
+
+### 1) Validate and build
+
+Windows (PowerShell):
+- `.\gradlew.bat clean test build`
+
+macOS/Linux:
+- `./gradlew clean test build`
+
+Expected artifact:
+- `build/libs/gwt-rpc-mapper.jar`
+
+### 2) Create and push tag
+
+- `git checkout main`
+- `git pull`
+- `git tag -a vX.Y.Z -m "Release vX.Y.Z"`
+- `git push origin vX.Y.Z`
+
+### 3) Publish GitHub release
+
+Option A (GitHub UI):
+1. Open repository `Releases` -> `Draft a new release`
+2. Select tag `vX.Y.Z`
+3. Title: `vX.Y.Z`
+4. Upload `build/libs/gwt-rpc-mapper.jar`
+5. Publish release
+
+Option B (GitHub CLI):
+- `gh release create vX.Y.Z build/libs/gwt-rpc-mapper.jar --title "vX.Y.Z" --notes "Release notes here"`
+
+### 4) Post-release checks
+
+- Verify the tag exists on remote: `git ls-remote --tags origin`
+- Verify release page includes the JAR asset
+- Optionally bump any in-repo version metadata for next development cycle
+
 ## Security & Redaction
 
 - Do not commit captured traffic, session tokens, cookies, auth headers, or local Burp state.
